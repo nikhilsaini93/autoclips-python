@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import argparse
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -10,6 +11,7 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import NoTranscriptFound
 from google import genai
 
 load_dotenv()
@@ -65,13 +67,31 @@ def get_video_id(url: str) -> str:
     raise ValueError("Invalid YouTube URL")
 
 
-def get_transcript(video_id: str) -> str:
+def get_transcript_snippets(video_id: str) -> list:
     ytt_api = YouTubeTranscriptApi()
-    fetched_transcript = ytt_api.fetch(video_id)
-    lines = []
-    for snippet in fetched_transcript:
-        seconds = int(snippet.start)
-        lines.append(f"[{seconds}] {snippet.text}")
+    try:
+        fetched_transcript = ytt_api.fetch(video_id, languages=("en",))
+    except NoTranscriptFound:
+        transcript_list = ytt_api.list(video_id)
+        transcript = next(iter(transcript_list), None)
+        if transcript is None:
+            raise
+        print(
+            f"English transcript not found; using {transcript.language} "
+            f"({transcript.language_code}).",
+            file=sys.stderr,
+        )
+        fetched_transcript = transcript.fetch()
+
+    return [
+        {"start": s.start, "duration": s.duration, "text": s.text}
+        for s in fetched_transcript
+    ]
+
+
+def get_transcript(video_id: str) -> str:
+    snippets = get_transcript_snippets(video_id)
+    lines = [f"[{int(s['start'])}] {s['text']}" for s in snippets]
     return "\n".join(lines)
 
 
@@ -229,7 +249,58 @@ def detect_face_center_x(
     return float(np.median(detected_centers))
 
 
-def cut_clip(input_path: Path, output_path: Path, start: str, end: str) -> None:
+def format_srt_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def build_clip_srt(video_id: str, start_sec: float, end_sec: float, srt_path: Path) -> bool:
+    """Writes an SRT file with timestamps relative to the clip's own start,
+    containing only the transcript lines that overlap [start_sec, end_sec].
+    Returns True if any subtitle lines were written."""
+    snippets = get_transcript_snippets(video_id)
+    clip_duration = end_sec - start_sec
+
+    entries = []
+    for s in snippets:
+        s_start = s["start"]
+        s_end = s["start"] + s["duration"]
+
+        if s_end <= start_sec or s_start >= end_sec:
+            continue  # snippet doesn't overlap this clip at all
+
+        rel_start = max(0.0, s_start - start_sec)
+        rel_end = min(clip_duration, s_end - start_sec)
+        if rel_end <= rel_start:
+            continue
+
+        entries.append((rel_start, rel_end, s["text"].replace("\n", " ")))
+
+    if not entries:
+        return False
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (rel_start, rel_end, text) in enumerate(entries, start=1):
+            f.write(f"{i}\n")
+            f.write(
+                f"{format_srt_timestamp(rel_start)} --> {format_srt_timestamp(rel_end)}\n"
+            )
+            f.write(f"{text}\n\n")
+
+    return True
+
+
+def cut_clip(
+    input_path: Path,
+    output_path: Path,
+    start: str,
+    end: str,
+    video_id: str | None = None,
+) -> None:
     width, height = get_video_dimensions(input_path)
 
     start_sec = time_to_seconds(start)
@@ -241,6 +312,24 @@ def cut_clip(input_path: Path, output_path: Path, start: str, end: str) -> None:
     x = round(face_center_x - crop_width / 2)
     x = max(0, min(x, width - crop_width))
 
+    vf_parts = [f"crop={crop_width}:{height}:{x}:0", "scale=1080:1920", "setsar=1"]
+
+    if video_id:
+        safe_name = f"{video_id}-{start}-{end}.srt".replace(":", "-")
+        srt_path = TMP_DIR / safe_name
+        has_subs = build_clip_srt(video_id, start_sec, end_sec, srt_path)
+        if has_subs:
+            # ffmpeg's subtitles filter needs ':' escaped inside the path arg
+            escaped_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
+            style = (
+                "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
+                "Alignment=2,MarginV=90"
+            )
+            vf_parts.append(f"subtitles='{escaped_path}':force_style='{style}'")
+
+    vf = ",".join(vf_parts)
+
     run([
         "ffmpeg", "-y",
         "-i", str(input_path),
@@ -248,40 +337,104 @@ def cut_clip(input_path: Path, output_path: Path, start: str, end: str) -> None:
         "-to", end,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-vf", f"crop={crop_width}:{height}:{x}:0,scale=1080:1920,setsar=1",
+        "-vf", vf,
         "-c:v", "libx264",
         "-c:a", "aac",
         str(output_path),
     ])
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        raise SystemExit("Usage: python main.py <youtube-url>")
+def cmd_video_id(args) -> None:
+    print(json.dumps({"video_id": get_video_id(args.url)}))
 
-    youtube_url = sys.argv[1]
-    video_id = get_video_id(youtube_url)
 
-    print("Getting transcript...")
-    transcript = get_transcript(video_id)
+def cmd_transcript(args) -> None:
+    print(json.dumps({"transcript": get_transcript(args.video_id)}))
 
-    print("Finding viral clips...")
+
+def cmd_clips(args) -> None:
+    transcript = sys.stdin.read()
     clips = find_viral_clips(transcript)
-    print(clips)
+    print(json.dumps(clips))
 
-    video_path = DOWNLOAD_DIR / f"{video_id}.mp4"
 
-    print("Downloading video...")
-    download_video(video_id, video_path)
-    print("Video downloaded.")
+def cmd_download(args) -> None:
+    output_path = DOWNLOAD_DIR / f"{args.video_id}.mp4"
+    download_video(args.video_id, output_path)
+    print(json.dumps({"path": str(output_path)}))
 
-    for i, clip in enumerate(clips, start=1):
-        output_path = CLIPS_DIR / f"clip-{i}.mp4"
-        print(f"Creating clip {i}")
-        cut_clip(video_path, output_path, clip["start"], clip["end"])
-        print(f"Saved: {output_path}")
 
-    print("All clips generated.")
+def cmd_cut(args) -> None:
+    output_path = CLIPS_DIR / f"{args.video_id}-clip-{args.index}.mp4"
+    cut_clip(Path(args.input), output_path, args.start, args.end, video_id=args.video_id)
+    print(json.dumps({"path": str(output_path)}))
+
+
+def cmd_auto_url(args) -> None:
+    video_id = get_video_id(args.url)
+    transcript = get_transcript(video_id)
+    clips = find_viral_clips(transcript)
+
+    input_path = DOWNLOAD_DIR / f"{video_id}.mp4"
+    if not input_path.exists():
+        download_video(video_id, input_path)
+
+    results = []
+    for index, clip in enumerate(clips, start=1):
+        output_path = CLIPS_DIR / f"{video_id}-clip-{index}.mp4"
+        cut_clip(
+            input_path,
+            output_path,
+            clip["start"],
+            clip["end"],
+            video_id=video_id,
+        )
+        results.append({
+            "index": index,
+            "title": clip.get("title"),
+            "start": clip["start"],
+            "end": clip["end"],
+            "path": str(output_path),
+        })
+
+    print(json.dumps({"video_id": video_id, "clips": results}, indent=2))
+
+
+def main() -> None:
+    commands = {"video-id", "transcript", "clips", "download", "cut"}
+    if len(sys.argv) == 2 and sys.argv[1] not in commands and not sys.argv[1].startswith("-"):
+        cmd_auto_url(argparse.Namespace(url=sys.argv[1]))
+        return
+
+    parser = argparse.ArgumentParser()
+    parser.epilog = 'Shortcut: python main.py "https://www.youtube.com/watch?v=..."'
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("video-id")
+    p.add_argument("url")
+    p.set_defaults(func=cmd_video_id)
+
+    p = sub.add_parser("transcript")
+    p.add_argument("video_id")
+    p.set_defaults(func=cmd_transcript)
+
+    p = sub.add_parser("clips")  # reads transcript from stdin
+    p.set_defaults(func=cmd_clips)
+
+    p = sub.add_parser("download")
+    p.add_argument("video_id")
+    p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("cut")
+    p.add_argument("--input", required=True)
+    p.add_argument("--video-id", required=True, dest="video_id")
+    p.add_argument("--index", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.set_defaults(func=cmd_cut)
+
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
