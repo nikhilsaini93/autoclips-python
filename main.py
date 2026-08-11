@@ -2,10 +2,12 @@ import os
 import sys
 import json
 import subprocess
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import cv2
+import numpy as np
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
@@ -18,15 +20,39 @@ COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE")
 DOWNLOAD_DIR = Path("downloads")
 CLIPS_DIR = Path("clips")
 TMP_DIR = Path("tmp")
+MODELS_DIR = Path("models")
 
-for d in (DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR):
+for d in (DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, MODELS_DIR):
     d.mkdir(exist_ok=True)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-_face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+# --- Face detector setup (OpenCV DNN, much more reliable than Haar cascades) ---
+
+PROTOTXT_PATH = MODELS_DIR / "deploy.prototxt"
+CAFFEMODEL_PATH = MODELS_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+
+PROTOTXT_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv/master/"
+    "samples/dnn/face_detector/deploy.prototxt"
 )
+CAFFEMODEL_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/"
+    "dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+)
+
+
+def ensure_face_model() -> None:
+    if not PROTOTXT_PATH.exists():
+        print("Downloading face detector config...")
+        urllib.request.urlretrieve(PROTOTXT_URL, PROTOTXT_PATH)
+    if not CAFFEMODEL_PATH.exists():
+        print("Downloading face detector weights (~10MB, one-time)...")
+        urllib.request.urlretrieve(CAFFEMODEL_URL, CAFFEMODEL_PATH)
+
+
+ensure_face_model()
+_face_net = cv2.dnn.readNetFromCaffe(str(PROTOTXT_PATH), str(CAFFEMODEL_PATH))
 
 
 def get_video_id(url: str) -> str:
@@ -130,38 +156,77 @@ def time_to_seconds(time_str: str) -> float:
     return m * 60 + s
 
 
-def detect_face_center_x(input_path: Path, at_seconds: float, frame_width: int) -> float:
-    frame_path = TMP_DIR / f"frame-{os.getpid()}-{int(at_seconds * 1000)}.jpg"
+def detect_face_center_x_in_frame(frame_path: Path, frame_width: int) -> float | None:
+    """Returns the x-center (in original video pixel coords) of the largest
+    detected face in the given frame image, or None if no face was found."""
+    img = cv2.imread(str(frame_path))
+    if img is None:
+        return None
 
-    run([
-        "ffmpeg", "-y",
-        "-ss", str(at_seconds),
-        "-i", str(input_path),
-        "-frames:v", "1",
-        str(frame_path),
-    ])
+    img_height, img_width = img.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0)
+    )
+    _face_net.setInput(blob)
+    detections = _face_net.forward()
 
-    try:
-        img = cv2.imread(str(frame_path))
-        if img is None:
-            return frame_width / 2
+    best_confidence = 0.0
+    best_center_x = None
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = _face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence < 0.5:
+            continue
+        box = detections[0, 0, i, 3:7] * np.array(
+            [img_width, img_height, img_width, img_height]
         )
+        start_x, _, end_x, _ = box
+        center_x = (start_x + end_x) / 2
+        if confidence > best_confidence:
+            best_confidence = confidence
+            best_center_x = center_x
 
-        if len(faces) == 0:
-            return frame_width / 2
+    if best_center_x is None:
+        return None
 
-        # pick the largest detected face as the main subject
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        face_center_x = x + w / 2
-        img_width = img.shape[1]
-        return (face_center_x / img_width) * frame_width
-    finally:
-        if frame_path.exists():
-            frame_path.unlink()
+    return (best_center_x / img_width) * frame_width
+
+
+def detect_face_center_x(
+    input_path: Path, start_sec: float, end_sec: float, frame_width: int
+) -> float:
+    """Samples several frames across the clip's duration and returns the
+    median detected face x-center, falling back to the frame center if no
+    face is found in any sampled frame."""
+    num_samples = 5
+    sample_times = [
+        start_sec + (end_sec - start_sec) * (i + 1) / (num_samples + 1)
+        for i in range(num_samples)
+    ]
+
+    detected_centers = []
+
+    for t in sample_times:
+        frame_path = TMP_DIR / f"frame-{os.getpid()}-{int(t * 1000)}.jpg"
+        run([
+            "ffmpeg", "-y",
+            "-ss", str(t),
+            "-i", str(input_path),
+            "-frames:v", "1",
+            str(frame_path),
+        ])
+        try:
+            center_x = detect_face_center_x_in_frame(frame_path, frame_width)
+            if center_x is not None:
+                detected_centers.append(center_x)
+        finally:
+            if frame_path.exists():
+                frame_path.unlink()
+
+    if not detected_centers:
+        return frame_width / 2
+
+    return float(np.median(detected_centers))
 
 
 def cut_clip(input_path: Path, output_path: Path, start: str, end: str) -> None:
@@ -169,9 +234,8 @@ def cut_clip(input_path: Path, output_path: Path, start: str, end: str) -> None:
 
     start_sec = time_to_seconds(start)
     end_sec = time_to_seconds(end)
-    mid_sec = start_sec + (end_sec - start_sec) / 2
 
-    face_center_x = detect_face_center_x(input_path, mid_sec, width)
+    face_center_x = detect_face_center_x(input_path, start_sec, end_sec, width)
 
     crop_width = round(height * 9 / 16)
     x = round(face_center_x - crop_width / 2)
