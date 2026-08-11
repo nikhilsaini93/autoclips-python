@@ -1,0 +1,4 @@
+python-dotenv
+google-genai
+youtube-transcript-api
+opencv-python-headless
