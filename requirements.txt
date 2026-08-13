@@ -1,4 +1,10 @@
+
+fastapi
+uvicorn[standard]
 python-dotenv
-google-genai
-youtube-transcript-api
-opencv-python-headless
+opencv-python
+numpy
+faster-whisper
+yt-dlp
+indic-transliteration
+python-multipart
