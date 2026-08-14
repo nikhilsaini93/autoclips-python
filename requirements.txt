@@ -1,4 +1,3 @@
-
 fastapi
 uvicorn[standard]
 python-dotenv
@@ -6,5 +5,5 @@ opencv-python
 numpy
 faster-whisper
 yt-dlp
-indic-transliteration
+google-genai
 python-multipart

@@ -488,11 +488,10 @@
 # if __name__ == "__main__":
 #     main()
 
-
 import logging
 import time
 import uuid
-from typing import Literal
+from typing import List, Literal, Optional
 
 from dotenv import load_dotenv
 
@@ -511,18 +510,21 @@ from video_utils import (
     CLIPS_DIR,
     TMP_DIR,
     download_video,
+    find_viral_clips,
     get_video_duration,
     get_video_id,
     render_video,
     time_to_seconds,
     transcribe_words_english,
-    transcribe_words_hinglish,
+    transcribe_words_native,
+    words_to_transcript_text,
     write_srt,
+    zip_clips,
 )
 
 app = FastAPI(
     title="YT Clip & Subtitle API",
-    description="Download a YouTube video, get Hinglish or English subtitles, or cut a clip by timestamp.",
+    description="Download a YouTube video, get English subtitles, cut a clip by timestamp, or auto-find every viral-worthy clip.",
 )
 
 
@@ -562,8 +564,35 @@ class ClipRequest(BaseModel):
     start: str = Field(..., description="Start time — 'HH:MM:SS', 'MM:SS', or seconds")
     end: str = Field(..., description="End time — 'HH:MM:SS', 'MM:SS', or seconds")
     vertical_crop: bool = Field(True, description="Crop to 9:16 vertical using face detection")
-    subtitles: Literal["none", "english", "hinglish"] = Field(
-        "none", description="Optionally burn subtitles into the clip"
+    subtitles: Literal["none", "english"] = Field(
+        "none", description="Optionally burn English subtitles into the clip"
+    )
+
+
+class AnalyzeClipsRequest(BaseModel):
+    url: str = Field(..., description="YouTube video URL")
+    max_clips: Optional[int] = Field(
+        None, ge=1, description="Cap the number of clips. Omit to let the AI decide the count entirely on its own."
+    )
+
+
+class ViralClipInfo(BaseModel):
+    title: Optional[str] = None
+    start: str
+    end: str
+    duration_seconds: float
+    score: Optional[float] = None
+    reason: Optional[str] = None
+
+
+class ViralClipsRequest(BaseModel):
+    url: str = Field(..., description="YouTube video URL")
+    max_clips: Optional[int] = Field(
+        None, ge=1, description="Cap the number of clips. Omit to get every viral-worthy clip Gemini finds (typically 6-10)."
+    )
+    vertical_crop: bool = Field(True, description="Crop each clip to 9:16 vertical using face detection")
+    subtitles: Literal["none", "english"] = Field(
+        "english", description="Optionally burn English subtitles into each clip"
     )
 
 
@@ -584,7 +613,7 @@ def health():
 @app.post("/subtitles/english")
 def subtitles_english(req: SubtitleRequest):
     """Transcribes the video and translates it to English (works even if the
-    source audio is Hindi/Hinglish/etc, via Whisper's translate task)."""
+    source audio is Hindi/Urdu/etc, via Whisper's translate task)."""
     logger.info("english subtitles requested url=%s burn_in=%s vertical_crop=%s", req.url, req.burn_in, req.vertical_crop)
     video_id, video_path = _prepare(req.url)
     words = transcribe_words_english(video_id, video_path)
@@ -603,34 +632,10 @@ def subtitles_english(req: SubtitleRequest):
     return FileResponse(output_path, filename=output_path.name, media_type="video/mp4")
 
 
-@app.post("/subtitles/hinglish")
-def subtitles_hinglish(req: SubtitleRequest):
-    """Transcribes Hindi speech and Romanizes it word-by-word into Hinglish-style text.
-    Note: this is a best-effort transliteration (Devanagari -> Roman), not a
-    hand-tuned Hinglish model, so slang/spelling won't always match how people
-    actually type Hinglish."""
-    logger.info("hinglish subtitles requested url=%s burn_in=%s vertical_crop=%s", req.url, req.burn_in, req.vertical_crop)
-    video_id, video_path = _prepare(req.url)
-    words = transcribe_words_hinglish(video_id, video_path)
-    duration = get_video_duration(video_path)
-
-    if not req.burn_in:
-        srt_path = TMP_DIR / f"{video_id}-hinglish.srt"
-        if not write_srt(words, 0.0, duration, srt_path):
-            raise HTTPException(422, "No speech detected")
-        logger.info("Returning hinglish srt for video_id=%s", video_id)
-        return FileResponse(srt_path, filename=f"{video_id}-hinglish.srt", media_type="application/x-subrip")
-
-    output_path = CLIPS_DIR / f"{video_id}-hinglish-{uuid.uuid4().hex[:8]}.mp4"
-    render_video(video_path, output_path, 0.0, duration, words=words, vertical_crop=req.vertical_crop)
-    logger.info("Returning hinglish mp4 for video_id=%s -> %s", video_id, output_path.name)
-    return FileResponse(output_path, filename=output_path.name, media_type="video/mp4")
-
-
 @app.post("/clip")
 def clip(req: ClipRequest):
     """Cuts [start, end] out of the video, optionally with a 9:16 face-aware
-    crop and/or burned-in subtitles."""
+    crop and/or burned-in English subtitles."""
     logger.info(
         "clip requested url=%s start=%s end=%s vertical_crop=%s subtitles=%s",
         req.url, req.start, req.end, req.vertical_crop, req.subtitles,
@@ -641,13 +646,112 @@ def clip(req: ClipRequest):
     if end_sec <= start_sec:
         raise HTTPException(400, "end must be after start")
 
-    words = None
-    if req.subtitles == "english":
-        words = transcribe_words_english(video_id, video_path)
-    elif req.subtitles == "hinglish":
-        words = transcribe_words_hinglish(video_id, video_path)
+    words = transcribe_words_english(video_id, video_path) if req.subtitles == "english" else None
 
     output_path = CLIPS_DIR / f"{video_id}-clip-{uuid.uuid4().hex[:8]}.mp4"
     render_video(video_path, output_path, start_sec, end_sec, words=words, vertical_crop=req.vertical_crop)
     logger.info("Returning clip for video_id=%s -> %s", video_id, output_path.name)
     return FileResponse(output_path, filename=output_path.name, media_type="video/mp4")
+
+
+def _analyze_viral_clips(video_id: str, video_path, max_clips: Optional[int]) -> list:
+    """Shared by /clips/analyze and /clips/viral: builds a native-language
+    transcript and asks Gemini to find every viral-worthy moment, with the
+    AI itself deciding how many clips that is (unless max_clips caps it)."""
+    native = transcribe_words_native(video_id, video_path)
+    transcript_text = words_to_transcript_text(native["words"])
+    try:
+        candidates = find_viral_clips(transcript_text, max_clips=max_clips)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    if not candidates:
+        raise HTTPException(422, "Gemini did not find any viral-worthy clips in this video")
+    return candidates
+
+
+@app.post("/clips/analyze", response_model=List[ViralClipInfo])
+def clips_analyze(req: AnalyzeClipsRequest):
+    """AI-only analysis pass: no rendering, no video files produced. The
+    model watches the transcript, decides for itself how many clips are
+    worth cutting (anywhere from 1 to 10+), and returns each one's
+    timestamps, a title, a confidence score, and its reasoning - so you can
+    review the picks before spending time actually rendering any of them."""
+    logger.info("clip analysis requested url=%s max_clips=%s", req.url, req.max_clips)
+    video_id, video_path = _prepare(req.url)
+    candidates = _analyze_viral_clips(video_id, video_path, req.max_clips)
+
+    results = []
+    for i, c in enumerate(candidates, start=1):
+        try:
+            start_sec = time_to_seconds(c["start"])
+            end_sec = time_to_seconds(c["end"])
+        except (KeyError, ValueError) as e:
+            logger.warning("Skipping malformed candidate #%d (%s): %s", i, c, e)
+            continue
+        if end_sec <= start_sec:
+            logger.warning("Skipping candidate #%d with end<=start: %s", i, c)
+            continue
+        results.append(ViralClipInfo(
+            title=c.get("title"),
+            start=c["start"],
+            end=c["end"],
+            duration_seconds=round(end_sec - start_sec, 1),
+            score=c.get("score"),
+            reason=c.get("reason"),
+        ))
+
+    if not results:
+        raise HTTPException(422, "All candidate clips were malformed")
+
+    logger.info("Analysis found %d viral-worthy clip(s) for video_id=%s", len(results), video_id)
+    return results
+
+
+@app.post("/clips/viral")
+def clips_viral(req: ViralClipsRequest):
+    """Auto-finds every viral-worthy clip in the video (via Gemini) and
+    renders ALL of them - not just the first one. Requires GEMINI_API_KEY.
+    Returns a .zip containing each clip .mp4 plus a manifest.json with each
+    clip's title/score/reason."""
+    logger.info(
+        "viral clips requested url=%s max_clips=%s vertical_crop=%s subtitles=%s",
+        req.url, req.max_clips, req.vertical_crop, req.subtitles,
+    )
+    video_id, video_path = _prepare(req.url)
+    candidates = _analyze_viral_clips(video_id, video_path, req.max_clips)
+    english_words = transcribe_words_english(video_id, video_path) if req.subtitles == "english" else None
+
+    entries = []
+    for i, candidate in enumerate(candidates, start=1):
+        try:
+            start_sec = time_to_seconds(candidate["start"])
+            end_sec = time_to_seconds(candidate["end"])
+        except (KeyError, ValueError) as e:
+            logger.warning("Skipping malformed candidate #%d (%s): %s", i, candidate, e)
+            continue
+        if end_sec <= start_sec:
+            logger.warning("Skipping candidate #%d with end<=start: %s", i, candidate)
+            continue
+
+        logger.info(
+            "Rendering viral clip %d/%d: '%s' [%s -> %s] score=%s",
+            i, len(candidates), candidate.get("title"), candidate.get("start"), candidate.get("end"), candidate.get("score"),
+        )
+        output_path = CLIPS_DIR / f"{video_id}-viral-{i}-{uuid.uuid4().hex[:8]}.mp4"
+        render_video(video_path, output_path, start_sec, end_sec, words=english_words, vertical_crop=req.vertical_crop)
+        entries.append({
+            "path": output_path,
+            "title": candidate.get("title"),
+            "start": candidate.get("start"),
+            "end": candidate.get("end"),
+            "score": candidate.get("score"),
+            "reason": candidate.get("reason"),
+        })
+
+    if not entries:
+        raise HTTPException(422, "All candidate clips were malformed - nothing to render")
+
+    zip_path = CLIPS_DIR / f"{video_id}-viral-{uuid.uuid4().hex[:8]}.zip"
+    zip_clips(zip_path, entries)
+    logger.info("Returning %d viral clip(s) for video_id=%s -> %s", len(entries), video_id, zip_path.name)
+    return FileResponse(zip_path, filename=zip_path.name, media_type="application/zip")

@@ -4,14 +4,13 @@ import time
 import logging
 import urllib.request
 import subprocess
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import cv2
 import numpy as np
 from faster_whisper import WhisperModel
-from indic_transliteration import sanscript
-from indic_transliteration.sanscript import transliterate
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +78,23 @@ def get_whisper_model() -> WhisperModel:
 
 
 # ---------------------------------------------------------------------------
+# Gemini (used only by the viral-clip finder)
+# ---------------------------------------------------------------------------
+_genai_client = None
+
+
+def get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set - required for the viral-clip finder route.")
+        from google import genai
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
+
+
+# ---------------------------------------------------------------------------
 # YouTube helpers
 # ---------------------------------------------------------------------------
 def get_video_id(url: str) -> str:
@@ -122,7 +138,7 @@ def download_video(video_id: str) -> Path:
         command += ["--cookies", COOKIES_FILE]
     command += [
         # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
-        # which matters since the clip gets re-decoded multiple times
+        # which matters since clips get re-decoded multiple times
         # (face-detection frame grabs + the final cut/subtitle burn)
         "-f", "bv*[vcodec^=avc1]+ba/bv*+ba/b",
         "--merge-output-format", "mp4",
@@ -174,16 +190,17 @@ def time_to_seconds(time_str) -> float:
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
-def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> list:
-    """Runs Whisper and returns word-level timestamps. Cached to disk per
-    (video_id, language, task) since transcription is the slowest step and
-    every route/clip on the same source video can reuse it."""
+def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> dict:
+    """Runs Whisper and returns {"language": <detected>, "words": [...]}.
+    Cached to disk per (video_id, language, task) since transcription is the
+    slowest step and every route/clip on the same source video reuses it."""
     cache_key = f"{video_id}-{language or 'auto'}-{task}"
     cache_path = TMP_DIR / f"{cache_key}-words.json"
     if cache_path.exists():
-        words = json.loads(cache_path.read_text())
-        logger.info("Using cached transcript for %s (%d words)", cache_key, len(words))
-        return words
+        result = json.loads(cache_path.read_text())
+        logger.info("Using cached transcript for %s (%d words, language=%s)",
+                    cache_key, len(result["words"]), result.get("language"))
+        return result
 
     logger.info("Transcribing video_id=%s (language=%s, task=%s) with Whisper...", video_id, language or "auto", task)
     t0 = time.perf_counter()
@@ -199,36 +216,106 @@ def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> l
         for word in segment.words:
             words.append({"start": word.start, "end": word.end, "text": word.word.strip()})
 
-    cache_path.write_text(json.dumps(words))
+    detected_language = getattr(info, "language", language or "unknown")
+    result = {"language": detected_language, "words": words}
+    cache_path.write_text(json.dumps(result))
     logger.info(
         "Transcription done for %s: %d segments, %d words, detected_language=%s, in %.1fs",
-        cache_key, segment_count, len(words), getattr(info, "language", "?"), time.perf_counter() - t0,
+        cache_key, segment_count, len(words), detected_language, time.perf_counter() - t0,
     )
-    return words
-
-
-def to_hinglish(text: str) -> str:
-    """Best-effort Romanization of Devanagari text (Hindi script -> Hinglish-style Roman)."""
-    try:
-        return transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
-    except Exception:
-        logger.debug("Transliteration failed for word %r, leaving as-is", text, exc_info=True)
-        return text
-
-
-def transcribe_words_hinglish(video_id: str, video_path: Path) -> list:
-    """Hindi speech, transcribed then transliterated word-by-word to Roman script."""
-    words = _transcribe_words(video_id, video_path, language="hi", task="transcribe")
-    logger.info("Transliterating %d words to Hinglish for video_id=%s...", len(words), video_id)
-    t0 = time.perf_counter()
-    result = [{"start": w["start"], "end": w["end"], "text": to_hinglish(w["text"])} for w in words]
-    logger.info("Transliteration done in %.2fs", time.perf_counter() - t0)
     return result
+
+
+def transcribe_words_native(video_id: str, video_path: Path) -> dict:
+    """Auto-detects the spoken language and transcribes in that language's
+    native script (no translation). Used to feed the viral-clip finder."""
+    return _transcribe_words(video_id, video_path, language=None, task="transcribe")
 
 
 def transcribe_words_english(video_id: str, video_path: Path) -> list:
     """Whisper's 'translate' task converts speech in any source language straight to English text."""
-    return _transcribe_words(video_id, video_path, language=None, task="translate")
+    return _transcribe_words(video_id, video_path, language=None, task="translate")["words"]
+
+
+def words_to_transcript_text(words: list) -> str:
+    """Groups words into ~12-word lines with a leading timestamp, the
+    '[seconds] text...' shape the viral-clip-finding prompt expects."""
+    lines = []
+    buffer = []
+    line_start = None
+
+    for w in words:
+        if line_start is None:
+            line_start = w["start"]
+        buffer.append(w["text"])
+        if len(buffer) >= 12:
+            lines.append(f"[{int(line_start)}] {' '.join(buffer)}")
+            buffer = []
+            line_start = None
+
+    if buffer:
+        lines.append(f"[{int(line_start)}] {' '.join(buffer)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Viral clip finder (Gemini)
+# ---------------------------------------------------------------------------
+def find_viral_clips(transcript: str, max_clips: int | None = None) -> list:
+    if max_clips:
+        count_instruction = f"Identify up to {max_clips} clips, ranked best first."
+    else:
+        count_instruction = (
+            "Identify EVERY clip in the video that's genuinely viral-worthy - "
+            "could be 1, could be 10+. Don't artificially limit the count, "
+            "but don't pad with weak clips either. Rank them best first."
+        )
+
+    prompt = f"""
+You are a professional YouTube Shorts editor.
+
+Analyze the transcript and find the best clips for standalone short-form videos.
+
+Rules:
+- {count_instruction}
+- Duration between 20 and 60 seconds.
+- Strong hook.
+- Valuable insight.
+- High engagement potential.
+- Understandable without full context.
+- Clips must not overlap each other.
+
+Return ONLY JSON.
+
+Format:
+
+[
+ {{
+   "title":"Clip Title",
+   "start":"00:01:20",
+   "end":"00:01:55",
+   "score":95,
+   "reason":"Curiosity hook"
+ }}
+]
+
+Transcript:
+
+{transcript}
+"""
+    logger.info("Asking Gemini to find viral clips (transcript length=%d chars)...", len(transcript))
+    t0 = time.perf_counter()
+    client = get_genai_client()
+    response = client.models.generate_content(model="gemini-3.5-flash", contents=prompt)
+    text = (response.text or "").replace("```json", "").replace("```", "").strip()
+    clips = json.loads(text)
+    if max_clips:
+        clips = clips[:max_clips]
+    logger.info("Gemini returned %d candidate clips in %.1fs", len(clips), time.perf_counter() - t0)
+    for c in clips:
+        logger.info("  candidate: [%s -> %s] score=%s '%s'", c.get("start"), c.get("end"), c.get("score"), c.get("title"))
+    return clips
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +496,17 @@ def render_video(
         "Render complete: %s (%.1f MB) in %.1fs total",
         output_path, size_mb, time.perf_counter() - t0,
     )
+
+
+def zip_clips(zip_path: Path, clip_entries: list) -> None:
+    """clip_entries: list of {"path": Path, "title", "start", "end", "score", "reason"}.
+    Bundles every rendered clip plus a manifest.json into one zip."""
+    manifest = [
+        {k: v for k, v in entry.items() if k != "path"} | {"file": entry["path"].name}
+        for entry in clip_entries
+    ]
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        for entry in clip_entries:
+            zf.write(entry["path"], arcname=entry["path"].name)
+    logger.info("Zipped %d clip(s) into %s", len(clip_entries), zip_path)
