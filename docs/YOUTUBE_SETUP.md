@@ -61,12 +61,12 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Option A — you downloaded the client JSON:
-python get_youtube_token.py --secrets client_secrets.json
+python scripts/get_youtube_token.py --secrets client_secrets.json
 
 # Option B — you only have the ID + secret:
 set YT_CLIENT_ID=your-id.apps.googleusercontent.com
 set YT_CLIENT_SECRET=your-secret
-python get_youtube_token.py
+python scripts/get_youtube_token.py
 ```
 
 What happens:
@@ -91,7 +91,7 @@ YT_REFRESH_TOKEN=1//0g-very-long-token...
 YT_CATEGORY_ID=22
 ```
 
-Then restart the bot (`uvicorn main:app --reload --port 8000` or restart your process).
+Then restart the bot (`uvicorn app.main:app --reload --port 8000` or restart your process).
 `GET /health` won't show YouTube status, but the first **Approve** tap will prove it works.
 
 ## Step 7 — Test end-to-end

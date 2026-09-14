@@ -4,8 +4,8 @@ import contextvars
 import os
 from pathlib import Path
 
-# Set by the request-id middleware in main.py; read by RequestIdFilter so every
-# log line emitted while handling a request - even deep inside video_utils.py -
+# Set by the request-id middleware in app.main; read by RequestIdFilter so every
+# log line emitted while handling a request - even deep inside services -
 # gets tagged with the same id, without having to pass a logger around.
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
@@ -16,12 +16,20 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+def _log_dir() -> Path:
+    try:
+        from app.config import LOGS_DIR
+        return LOGS_DIR
+    except Exception:
+        return Path(__file__).resolve().parent.parent / "storage" / "logs"
+
+
 def setup_logging() -> None:
     level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
 
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+    log_dir = _log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = "%(asctime)s | %(levelname)-8s | req=%(request_id)s | %(name)s | %(message)s"
     formatter = logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S")

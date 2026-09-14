@@ -25,10 +25,7 @@ dist/
 # Logs and local files
 *.log
 logs/
+storage/
 .DS_Store
 
 *.mp4
-downloads/
-clips/
-tmp/
-videos/

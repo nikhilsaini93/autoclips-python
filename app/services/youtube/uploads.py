@@ -2,15 +2,17 @@
 
 Auth is OAuth user credentials (service accounts cannot upload to YouTube):
   YT_CLIENT_ID / YT_CLIENT_SECRET / YT_REFRESH_TOKEN in .env
-Get the refresh token once via:  python get_youtube_token.py
+Get the refresh token once via:  python scripts/get_youtube_token.py
 
 One upload costs ~1600 quota units; default project quota (10,000/day)
 allows roughly 6 uploads per day.
 """
 
 import logging
-import os
 from pathlib import Path
+
+from app.config import settings
+from app.services.youtube.descriptions import build_yt_description
 
 logger = logging.getLogger(__name__)
 
@@ -19,55 +21,6 @@ _TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 TITLE_LIMIT = 100
 DESCRIPTION_LIMIT = 5000
-
-FAIR_USE_DISCLAIMER = (
-    "Copyright Disclaimer Under Section 107 of the Copyright Act 1976, allowance is made for "
-    "'Fair Use' for purposes such as criticism, comment, news reporting, teaching, scholarship, "
-    "and research. Fair use is a permitted by copyright statute that might otherwise be "
-    "infringing, Non-profit, educational or personal use tips the balance in favour of fair use."
-)
-
-
-def build_yt_description(description=None, video_id=None, video_url=None, credit=None) -> str:
-    """Builds the final Shorts description in the channel format.
-
-    Format:
-        <AI Hinglish description>
-
-        Credit :- @channel
-        Original video link:- https://www.youtube.com/watch?v=VIDEO_ID
-
-        <Fair-use disclaimer>
-
-    Hashtags are appended separately by build_upload_body, so they are NOT
-    added here. Idempotent — if credit/link/disclaimer lines are already
-    present they are not duplicated.
-    """
-    desc = (description or "").strip()
-
-    link = (video_url or "").strip()
-    if not link and video_id:
-        link = f"https://www.youtube.com/watch?v={str(video_id).strip()}"
-
-    credit = (credit or "").strip()
-
-    parts: list[str] = []
-    if desc:
-        parts.append(desc)
-
-    if credit and "Credit :-" not in desc:
-        parts.append(f"Credit :- {credit}")
-    if link and "Original video link" not in desc:
-        parts.append(f"Original video link:- {link}")
-
-    if "Copyright Disclaimer Under Section 107" not in desc:
-        if parts:
-            parts.append("")
-        parts.append(FAIR_USE_DISCLAIMER)
-
-    if not parts:
-        return FAIR_USE_DISCLAIMER
-    return "\n".join(parts).strip()
 
 
 def _clean_tags(hashtags) -> list[str]:
@@ -110,7 +63,7 @@ def build_upload_body(title, description=None, hashtags=None, category_id=None, 
             "title": clean_title,
             "description": desc,
             "tags": tags,
-            "categoryId": category_id or os.environ.get("YT_CATEGORY_ID", "22"),
+            "categoryId": category_id or settings.YT_CATEGORY_ID,
         },
         "status": {
             "privacyStatus": "unlisted",
@@ -122,18 +75,18 @@ def build_upload_body(title, description=None, hashtags=None, category_id=None, 
 
 def get_youtube_service(client_id=None, client_secret=None, refresh_token=None):
     """Builds an authenticated YouTube service, refreshing the token."""
+    cid = client_id or settings.YT_CLIENT_ID
+    csec = client_secret or settings.YT_CLIENT_SECRET
+    rtoken = refresh_token or settings.YT_REFRESH_TOKEN
+    if not (cid and csec and rtoken):
+        raise RuntimeError(
+            "YouTube OAuth not configured. Set YT_CLIENT_ID / YT_CLIENT_SECRET / "
+            "YT_REFRESH_TOKEN in .env (see docs + scripts/get_youtube_token.py)."
+        )
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
 
-    cid = client_id or os.environ.get("YT_CLIENT_ID", "")
-    csec = client_secret or os.environ.get("YT_CLIENT_SECRET", "")
-    rtoken = refresh_token or os.environ.get("YT_REFRESH_TOKEN", "")
-    if not (cid and csec and rtoken):
-        raise RuntimeError(
-            "YouTube OAuth not configured. Set YT_CLIENT_ID / YT_CLIENT_SECRET / "
-            "YT_REFRESH_TOKEN in .env (see readme + get_youtube_token.py)."
-        )
     creds = Credentials(
         token=None,
         refresh_token=rtoken,
@@ -148,12 +101,13 @@ def get_youtube_service(client_id=None, client_secret=None, refresh_token=None):
 
 def upload_unlisted(video_path, title, description=None, hashtags=None, category_id=None, video_id=None, video_url=None, credit=None) -> dict:
     """Uploads a file as Unlisted. Returns {"video_id": ..., "url": ...}."""
-    from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaFileUpload
-
     path = Path(video_path)
     if not path.is_file():
         raise FileNotFoundError(f"Clip not found: {path}")
+
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaFileUpload
+
     size_mb = path.stat().st_size / (1024 * 1024)
     logger.info("Uploading %s (%.1f MB) to YouTube as unlisted...", path.name, size_mb)
 
@@ -168,9 +122,9 @@ def upload_unlisted(video_path, title, description=None, hashtags=None, category
         if "quotaExceeded" in content:
             raise RuntimeError("YouTube quota exceeded (≈6 uploads/day on default quota). Try again tomorrow.")
         if "invalid_grant" in content or "unauthorized" in content.lower():
-            raise RuntimeError("YouTube OAuth token invalid/expired. Re-run get_youtube_token.py and update YT_REFRESH_TOKEN.")
+            raise RuntimeError("YouTube OAuth token invalid/expired. Re-run scripts/get_youtube_token.py and update YT_REFRESH_TOKEN.")
         raise RuntimeError(f"YouTube upload failed: {content or e}")
 
-    video_id = response.get("id", "")
-    logger.info("YouTube upload complete: video_id=%s title=%r", video_id, body["snippet"]["title"])
-    return {"video_id": video_id, "url": f"https://youtu.be/{video_id}" if video_id else ""}
+    new_video_id = response.get("id", "")
+    logger.info("YouTube upload complete: video_id=%s title=%r", new_video_id, body["snippet"]["title"])
+    return {"video_id": new_video_id, "url": f"https://youtu.be/{new_video_id}" if new_video_id else ""}

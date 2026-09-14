@@ -32,28 +32,35 @@ def _clip(tmp_path):
 
 
 def test_send_retries_timeout_then_succeeds(monkeypatch, tmp_path):
-    import main as m
+    import app.telegram.bot as bot_mod
+    import app.telegram.sending as sending
     from telegram import InlineKeyboardMarkup
 
-    monkeypatch.setattr(m, "telegram_bot", FakeBot(["timeout", "timeout", "ok"]))
-    sent = asyncio.run(m.send_clip_to_telegram(
+    fake = FakeBot(["timeout", "timeout", "ok"])
+    monkeypatch.setattr(bot_mod, "telegram_bot", fake)
+    monkeypatch.setattr(bot_mod, "get_bot", lambda: fake)
+    sent = asyncio.run(sending.send_clip_to_telegram(
         _clip(tmp_path),
         "vid-1", "Title", 90, "reason", ["a"], "desc",
     ))
     assert sent is True
-    assert m.telegram_bot.calls == 3
-    assert isinstance(m.telegram_bot.last_kwargs["reply_markup"], InlineKeyboardMarkup)
+    assert fake.calls == 3
+    assert isinstance(fake.last_kwargs["reply_markup"], InlineKeyboardMarkup)
 
 
 def test_send_gives_up_and_drops_token(monkeypatch, tmp_path):
-    import main as m
+    import app.telegram.bot as bot_mod
+    import app.telegram.sending as sending
+    from app.services.approvals import pending_uploads
 
-    monkeypatch.setattr(m, "telegram_bot", FakeBot(["timeout"] * 10))
-    before = set(m.pending_uploads)
-    sent = asyncio.run(m.send_clip_to_telegram(
+    fake = FakeBot(["timeout"] * 10)
+    monkeypatch.setattr(bot_mod, "telegram_bot", fake)
+    monkeypatch.setattr(bot_mod, "get_bot", lambda: fake)
+    before = set(pending_uploads)
+    sent = asyncio.run(sending.send_clip_to_telegram(
         _clip(tmp_path), "vid-9", "Title", 90, "reason",
     ))
     assert sent is False
-    assert m.telegram_bot.calls == 3
+    assert fake.calls == 3
     # No leaked approval token for the undelivered clip.
-    assert set(m.pending_uploads) == before
+    assert set(pending_uploads) == before

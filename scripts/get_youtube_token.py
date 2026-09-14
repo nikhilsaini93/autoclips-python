@@ -8,10 +8,10 @@ Prereqs (5 min, Google Cloud Console):
 
 Usage:
   # Option A (client JSON file — easiest):
-  python get_youtube_token.py --secrets client_secrets.json
+  python scripts/get_youtube_token.py --secrets client_secrets.json
 
   # Option B (env vars):
-  set YT_CLIENT_ID=... & set YT_CLIENT_SECRET=... & python get_youtube_token.py
+  set YT_CLIENT_ID=... & set YT_CLIENT_SECRET=... & python scripts/get_youtube_token.py
 
 A browser window opens → sign in with the channel-owning Google account →
 Allow → paste the code back if asked. The script prints YT_REFRESH_TOKEN;
@@ -87,6 +87,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-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

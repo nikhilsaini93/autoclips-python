@@ -31,16 +31,16 @@ One-time YouTube setup (~5 min, needed only for Approve):
 1. Google Cloud project → enable **YouTube Data API v3**.
 2. OAuth consent screen → External → add your Gmail as a test user.
 3. Credentials → OAuth client ID → **Desktop app** → note client ID + secret (or download `client_secrets.json`).
-4. `python get_youtube_token.py --secrets client_secrets.json` (or set `YT_CLIENT_ID`/`YT_CLIENT_SECRET` first) → sign in with the channel account → copy `YT_REFRESH_TOKEN` into `.env` → restart the bot.
+4. `python scripts/get_youtube_token.py --secrets client_secrets.json` (or set `YT_CLIENT_ID`/`YT_CLIENT_SECRET` first) → sign in with the channel account → copy `YT_REFRESH_TOKEN` into `.env` → restart the bot.
 
-Full click-by-click walkthrough with screenshots-described steps and troubleshooting: see **[YOUTUBE_SETUP.md](YOUTUBE_SETUP.md)**.
+Full click-by-click walkthrough with screenshots-described steps and troubleshooting: see **[YOUTUBE_SETUP.md](docs/YOUTUBE_SETUP.md)**.
 
 Quota note: one upload ≈ 1600 units; the default 10,000 units/day project quota ≈ **~6 uploads/day**. Failed uploads keep the clip file and offer a retry button.
 
 ## Run
 
 ```bash
-uvicorn main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000
 ```
 
 Interactive docs: http://localhost:8000/docs
@@ -101,9 +101,9 @@ The count isn't fixed — the AI decides how many clips are actually worth cutti
 Every step logs progress with timing, since downloads/transcription/rendering can take a while:
 
 - Console (stdout) — for watching `uvicorn` while it runs
-- `logs/app.log` — rotating file (10 MB x 5 backups), so history survives restarts
+- `storage/logs/app.log` — rotating file (10 MB x 5 backups), so history survives restarts
 
-Each request gets a short 8-char request id (also returned as the `X-Request-ID` response header), and every log line for that request — across `main.py` and `video_utils.py` — is tagged with it, so you can `grep req=abcd1234 logs/app.log` to follow one request end-to-end even with several running at once.
+Each request gets a short 8-char request id (also returned as the `X-Request-ID` response header), and every log line for that request — across `app/` services — is tagged with it, so you can `grep req=abcd1234 storage/logs/app.log` to follow one request end-to-end even with several running at once.
 
 Example line:
 ```
@@ -118,15 +118,35 @@ Set verbosity with `LOG_LEVEL` in `.env` (`DEBUG` also logs every ffmpeg/yt-dlp 
 
 - `GET /health` — ffmpeg/ffprobe availability, `GEMINI_API_KEY` set, disk free, Whisper model.
 - `GET /jobs/{job_id}` — Telegram long generations (`ai_viral`, `timestamp`) report `running/done/failed` + progress here.
-- `POST /admin/cleanup?max_age_hours=72` — purge `downloads/ clips/ tmp/` files older than the TTL.
+- `POST /admin/cleanup?max_age_hours=72` — purge `storage/downloads|clips|tmp|videos` files older than the TTL.
 - Rate limits (per IP, no auth): `/subtitles/english` + `/clip` 20/min, `/clips/analyze` 10/min, `/clips/viral` 5/min.
 - Telegram is private: only `TELEGRAM_CHAT_ID` + `TELEGRAM_ALLOWED_CHAT_IDS` are served, others get `⛔ Unauthorized`.
 - Env knobs: `WHISPER_MODEL_SIZE/WHISPER_DEVICE/WHISPER_COMPUTE_TYPE`, `FFMPEG_PRESET`, `YOUTUBE_COOKIES_FILE`. See `.env.example`.
 
 ## Notes / design choices
 
-- Every route downloads (and caches on disk under `downloads/`) the source video once per `video_id`, and Whisper transcripts are cached under `tmp/` per `(video_id, language, task)` — so calling multiple routes against the same video reuses work instead of redoing it.
+- Every route downloads (and caches on disk under `storage/downloads/`) the source video once per `video_id`, and Whisper transcripts are cached under `storage/tmp/` per `(video_id, language, task)` — so calling multiple routes against the same video reuses work instead of redoing it.
 - Routes are defined as regular (non-`async`) functions on purpose: FastAPI runs blocking `def` routes in a threadpool, which is what you want here since `yt-dlp`, Whisper, `ffmpeg`, and the Gemini call all block.
 - Subtitles are `none` | `english` (Whisper translate) | `native` (as spoken). `/clips/analyze` and `/clips/viral` always analyze the *native-language* transcript (auto-detected) so clip boundaries line up with what's actually said; the burn-in track follows the `subtitles` you pick. Whisper defaults to the `small` model for better Hindi/Hinglish accuracy (override via `WHISPER_MODEL_SIZE`).
 - Neither route hard-caps the clip count by default — Gemini is asked for every clip that's genuinely viral-worthy and decides that count itself (pass `max_clips` if you want a ceiling). Malformed candidates (bad timestamps, end before start) are skipped with a warning rather than failing the whole batch.
 - For long videos, requests can take a while (download + transcribe + ffmpeg encode all happen synchronously within the request; `/clips/viral` does this once per clip). Telegram flows report progress via `GET /jobs/{job_id}`; the natural next step if this needs to scale further is a durable queue (e.g. Celery/RQ) instead of in-memory jobs.
+
+## Structure
+
+```
+app/
+  main.py              # FastAPI app + lifespan (uvicorn app.main:app)
+  config.py            # Settings + storage/assets paths
+  logging_config.py
+  api/                 # schemas + routes (health/subtitles/clip/analyze/viral)
+  telegram/            # bot, handlers, sending, progress, approvals
+  services/
+    video/             # ids/download/transcribe/gemini/subtitles/faces/render/cleanup
+    youtube/           # descriptions/uploads
+    jobs.py approvals.py viral.py
+assets/face_detector/  # OpenCV DNN weights
+scripts/               # get_youtube_token.py, send_telegram_test.py
+docs/                  # YOUTUBE_SETUP.md
+storage/               # gitignored: downloads/clips/tmp/videos/logs
+tests/unit/
+```
