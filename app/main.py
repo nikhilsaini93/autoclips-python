@@ -59,6 +59,16 @@ async def lifespan(app: FastAPI):
             "YouTube upload NOT configured (YT_CLIENT_ID / YT_CLIENT_SECRET / YT_REFRESH_TOKEN missing) — "
             "Telegram Approve will fail until you run scripts/get_youtube_token.py (see docs/YOUTUBE_SETUP.md)."
         )
+    if not (settings.META_PAGE_TOKEN and settings.IG_USER_ID):
+        logger.warning(
+            "Instagram upload NOT configured (META_PAGE_TOKEN / IG_USER_ID missing) — "
+            "IG Approve button hidden until you run scripts/get_meta_token.py (see docs/META_SETUP.md)."
+        )
+    if not (settings.META_PAGE_TOKEN and settings.FB_PAGE_ID):
+        logger.warning(
+            "Facebook upload NOT configured (META_PAGE_TOKEN / FB_PAGE_ID missing) — "
+            "FB Approve button hidden until you run scripts/get_meta_token.py (see docs/META_SETUP.md)."
+        )
 
     yield
 

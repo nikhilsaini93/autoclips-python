@@ -38,6 +38,11 @@ def health():
         "gemini_key_set": bool(settings.GEMINI_API_KEY),
         "disk_free_mb": disk_free_mb,
         "whisper_model": settings.WHISPER_MODEL_SIZE,
+        "youtube_configured": bool(
+            settings.YT_CLIENT_ID and settings.YT_CLIENT_SECRET and settings.YT_REFRESH_TOKEN
+        ),
+        "instagram_configured": bool(settings.META_PAGE_TOKEN and settings.IG_USER_ID),
+        "facebook_configured": bool(settings.META_PAGE_TOKEN and settings.FB_PAGE_ID),
     }
 
 

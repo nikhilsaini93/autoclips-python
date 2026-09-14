@@ -4,7 +4,7 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
-from app.services.approvals import pop_pending_upload, register_pending_upload
+from app.services.approvals import drop_sibling_uploads, pop_pending_upload, register_pending_upload
 from app.services.jobs import create_job, update_job
 
 logger = logging.getLogger(__name__)
@@ -42,16 +42,15 @@ async def handle_approve(update, context, token: str):
             entry.get("credit") or None,
         )
         update_job(job_id, status="done", result=result)
+        # NOTE: do NOT edit the original clip caption — it still carries the
+        # IG/FB Approve buttons for the same file. Send a separate message.
         try:
-            await query.edit_message_caption(
-                caption=f"✅ Uploaded as Unlisted\n\n🎯 {entry['title']}\n🔗 {result.get('url', '')}\n🆔 {entry['clip_id']}"
-            )
-        except TelegramError:
-            logger.debug("Could not edit caption for %s, sending message instead", entry["clip_id"])
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"✅ Uploaded as Unlisted\n\n🎯 {entry['title']}\n🔗 {result.get('url', '')}\n🆔 {entry['clip_id']}",
+                text=f"✅ YouTube Unlisted\n\n🎯 {entry['title']}\n🔗 {result.get('url', '')}\n🆔 {entry['clip_id']}",
             )
+        except TelegramError:
+            logger.debug("Could not send YT success message for %s", entry["clip_id"])
         logger.info("Approved upload done clip=%s yt=%s", entry["clip_id"], result.get("video_id"))
     except Exception as e:
         logger.exception("YouTube upload failed for %s", entry["clip_id"])
@@ -61,6 +60,7 @@ async def handle_approve(update, context, token: str):
             entry["path"], entry["clip_id"], entry["title"],
             entry.get("description"), entry.get("hashtags"), chat_id,
             source_video_id=entry.get("source_video_id"), credit=entry.get("credit"),
+            platform="youtube",
         )
         try:
             await context.bot.send_message(
@@ -79,7 +79,11 @@ async def handle_approve(update, context, token: str):
 
 
 async def handle_deny(update, context, token: str):
-    """Deletes the denied clip MP4 to free space (single-use token)."""
+    """Deletes the denied clip MP4 to free space (single-use token).
+
+    Also drops sibling Approve tokens (IG/FB/YT) for the same file so stale
+    buttons resolve to "Already processed" instead of FileNotFound errors.
+    """
     from pathlib import Path
 
     query = update.callback_query
@@ -88,6 +92,11 @@ async def handle_deny(update, context, token: str):
         await query.answer("Already processed.", show_alert=True)
         return
     await query.answer("Deleting clip…")
+    # Invalidate other platforms' buttons for this same file.
+    try:
+        drop_sibling_uploads(entry.get("path"))
+    except Exception:
+        logger.debug("Sibling token purge failed for %s", entry.get("clip_id"), exc_info=True)
     freed_mb = 0.0
     try:
         p = Path(entry["path"])

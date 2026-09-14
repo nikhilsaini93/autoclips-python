@@ -76,22 +76,65 @@ async def send_clip_to_telegram(
         overflow = caption
         caption = caption[:1000] + "\n…(cont.)"
 
-    # Per-clip Approve/Deny → YouTube Unlisted upload or delete.
-    # Registered before sending so the buttons always resolve.
+    # Per-clip Approve/Deny → YouTube / Instagram / Facebook upload or delete.
+    # One token per platform pointing at the same file so each destination
+    # can be approved (and retried) independently. Registered before sending
+    # so the buttons always resolve.
+    tokens: dict[str, str] = {}
     try:
-        approve_token = register_pending_upload(
+        tokens["youtube"] = register_pending_upload(
             video_path, clip_id, title, description, tags,
             chat_id, source_video_id=source_video_id, credit=credit,
+            platform="youtube",
         )
+        try:
+            from app.services.meta.tokens import (
+                is_facebook_configured,
+                is_instagram_configured,
+            )
+
+            if is_instagram_configured():
+                tokens["instagram"] = register_pending_upload(
+                    video_path, clip_id, title, description, tags,
+                    chat_id, source_video_id=source_video_id, credit=credit,
+                    platform="instagram",
+                )
+            if is_facebook_configured():
+                tokens["facebook"] = register_pending_upload(
+                    video_path, clip_id, title, description, tags,
+                    chat_id, source_video_id=source_video_id, credit=credit,
+                    platform="facebook",
+                )
+        except Exception:
+            logger.exception("Meta platform check failed for %s (YT-only buttons)", clip_id)
     except Exception:
         logger.exception("Failed to register pending upload for %s", clip_id)
-        approve_token = None
+        tokens = {}
     keyboard = None
-    if approve_token:
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve → YouTube (Unlisted)", callback_data=f"approve:{approve_token}"),
-            InlineKeyboardButton("❌ Deny (delete)", callback_data=f"deny:{approve_token}"),
-        ]])
+    if tokens:
+        rows = []
+        if "youtube" in tokens:
+            rows.append([
+                InlineKeyboardButton("✅ YouTube (Unlisted)", callback_data=f"approve:{tokens['youtube']}"),
+            ])
+        meta_row = []
+        if "instagram" in tokens:
+            meta_row.append(
+                InlineKeyboardButton("📸 IG Reel", callback_data=f"approve_ig:{tokens['instagram']}"),
+            )
+        if "facebook" in tokens:
+            meta_row.append(
+                InlineKeyboardButton("📘 FB Reel", callback_data=f"approve_fb:{tokens['facebook']}"),
+            )
+        if meta_row:
+            rows.append(meta_row)
+        # Deny deletes the file — reuse the first token so the handler can
+        # purge its siblings (other platforms) for the same clip.
+        deny_token = tokens.get("youtube") or next(iter(tokens.values()))
+        rows.append([
+            InlineKeyboardButton("❌ Deny (delete)", callback_data=f"deny:{deny_token}"),
+        ])
+        keyboard = InlineKeyboardMarkup(rows)
 
     sent = False
     for attempt in (1, 2, 3):
@@ -117,10 +160,10 @@ async def send_clip_to_telegram(
             break
 
     if not sent:
-        # User never got the buttons — drop the token so Approve can't
+        # User never got the buttons — drop the tokens so Approve can't
         # point at an undelivered clip, and tell them where the file is.
-        if approve_token:
-            pending_uploads.pop(approve_token, None)
+        for tok in tokens.values():
+            pending_uploads.pop(tok, None)
         try:
             await telegram_bot.send_message(
                 chat_id=chat_id,

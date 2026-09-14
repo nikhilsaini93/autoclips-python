@@ -7,6 +7,7 @@ from telegram.ext import ContextTypes
 from app.telegram.auth import reject_if_unauthorized
 from app.telegram.cleanup_files import delete_all_files
 from app.telegram.handlers_approve import handle_approve, handle_deny
+from app.telegram.handlers_approve_meta import handle_approve_fb, handle_approve_ig
 from app.telegram.handlers_generate import run_ai_generation, run_timestamp_generation
 from app.telegram.handlers_start import ask_subtitles
 
@@ -130,6 +131,14 @@ async def telegram_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_timestamp_generation(query, context)
         else:
             await query.edit_message_text("❌ No active mode. Send /start.")
+        return
+
+    if data.startswith("approve_ig:"):
+        await handle_approve_ig(update, context, data.split(":", 1)[1])
+        return
+
+    if data.startswith("approve_fb:"):
+        await handle_approve_fb(update, context, data.split(":", 1)[1])
         return
 
     if data.startswith("approve:"):

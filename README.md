@@ -20,12 +20,14 @@ You also need `ffmpeg` and `ffprobe` on PATH (`sudo apt install ffmpeg` / `brew 
 
 `GEMINI_API_KEY` in `.env` is only required for `/clips/analyze` and `/clips/viral` — the other two routes work without it.
 
-## Telegram Approve → YouTube upload
+## Telegram Approve → YouTube / Instagram / Facebook upload
 
-Every clip sent to Telegram carries **✅ Approve → YouTube (Unlisted)** and **❌ Deny (delete)** buttons.
+Every clip sent to Telegram carries per-platform Approve buttons and **❌ Deny (delete)**.
 
-- **Approve** uploads that clip as **Unlisted** with the AI title, description, and hashtags (as tags). Nothing is published — you schedule/publish later from YouTube Studio.
-- **Deny** deletes just that clip MP4 and reports freed space. Source video + transcripts stay cached (use Delete-All / `POST /admin/cleanup` for full wipes).
+- **✅ YouTube (Unlisted)** uploads that clip as **Unlisted** with the AI title, description, and hashtags (as tags). Nothing is published — you schedule/publish later from YouTube Studio.
+- **📸 IG Reel** publishes to your linked Instagram Professional account (caption = title + description + footer + hashtags).
+- **📘 FB Reel** publishes to your Facebook Page (clips >90s fall back to a regular Page video post when `META_FB_FALLBACK_TO_VIDEO=true`).
+- **Deny** deletes just that clip MP4 and reports freed space (also invalidates its other Approve buttons). Source video + transcripts stay cached (use Delete-All / `POST /admin/cleanup` for full wipes). Each platform keeps its own retry button on failure — the file is kept.
 
 One-time YouTube setup (~5 min, needed only for Approve):
 1. Google Cloud project → enable **YouTube Data API v3**.
@@ -36,6 +38,14 @@ One-time YouTube setup (~5 min, needed only for Approve):
 Full click-by-click walkthrough with screenshots-described steps and troubleshooting: see **[YOUTUBE_SETUP.md](docs/YOUTUBE_SETUP.md)**.
 
 Quota note: one upload ≈ 1600 units; the default 10,000 units/day project quota ≈ **~6 uploads/day**. Failed uploads keep the clip file and offer a retry button.
+
+One-time Meta setup (~10 min, needed only for IG/FB buttons):
+1. Facebook Page linked to an Instagram **Professional** account.
+2. Meta App + Facebook Login for Business → note `META_APP_ID`/`META_APP_SECRET`.
+3. Graph API Explorer → User token with `pages_show_list, pages_read_engagement, pages_manage_posts, instagram_basic, instagram_content_publish`.
+4. `python scripts/get_meta_token.py --user-token <TOKEN> --app-id <ID> --app-secret <SECRET>` → copy `META_PAGE_TOKEN`/`FB_PAGE_ID`/`IG_USER_ID` into `.env` → restart. Buttons appear only when configured (`GET /health` shows `instagram_configured`/`facebook_configured`).
+
+Full walkthrough: see **[META_SETUP.md](docs/META_SETUP.md)**. Limits: FB ~30 Reels/24h (clips must be 3–90s), IG ~25/day; Page token lasts ~60 days (re-run helper).
 
 ## Run
 

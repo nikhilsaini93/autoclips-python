@@ -32,6 +32,21 @@ class Settings(BaseSettings):
     YT_REFRESH_TOKEN: str = ""
     YT_CATEGORY_ID: str = "22"
 
+    # Meta uploads (Instagram Reels + Facebook Page Reels) for approved clips.
+    # Setup: Meta App + FB Page linked to IG Professional → long-lived Page
+    # token via scripts/get_meta_token.py (see docs/META_SETUP.md).
+    META_APP_ID: str = ""
+    META_APP_SECRET: str = ""
+    META_PAGE_TOKEN: str = ""
+    FB_PAGE_ID: str = ""
+    IG_USER_ID: str = ""
+    META_API_VERSION: str = "v26.0"
+    # Share IG reels to profile feed as well as Reels tab.
+    META_IG_SHARE_TO_FEED: bool = True
+    # FB Reels must be 3-90s. If True, longer clips fall back to a regular
+    # Page video post instead of failing.
+    META_FB_FALLBACK_TO_VIDEO: bool = True
+
     FACE_CONF_THRESHOLD: float = 0.5
     FACE_DETECT_SAMPLES: int = 3
     SKIP_FACE_DETECT: bool = False
