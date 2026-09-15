@@ -98,7 +98,7 @@ Transcript:
     clips: list = []
     for attempt in range(1, 3):
         try:
-            response = client.models.generate_content(model="gemini-3.5-flash", contents=prompt)
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             text = (response.text or "").strip()
             # Strip common markdown fences: ```json ... ``` or ``` ... ```
             if text.startswith("```"):
