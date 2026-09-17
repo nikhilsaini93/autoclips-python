@@ -36,25 +36,6 @@ async def send_clip_to_telegram(
 
     chat_id = settings.TELEGRAM_CHAT_ID
 
-    # Telegram Bot API videos are capped at ~50MB — skip gracefully instead
-    # of failing the whole batch when one clip is too large.
-    try:
-        size_mb = Path(video_path).stat().st_size / (1024 * 1024)
-    except OSError:
-        size_mb = 0
-    # Oversize path also returns False — no buttons were attached.
-    if size_mb > 50:
-        logger.warning("Skipping Telegram send for %s (%.1f MB > 50MB limit)", clip_id, size_mb)
-        try:
-            await telegram_bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Clip {clip_id} too large for Telegram ({size_mb:.1f} MB > 50MB).\n"
-                     f"File kept at: {Path(video_path).name} (no Approve buttons — upload it manually).",
-            )
-        except TelegramError:
-            logger.exception("Failed to send too-large notice for %s", clip_id)
-        return False
-
     tags = [str(t).strip("# ").strip() for t in (hashtags or []) if str(t).strip("# ").strip()]
     hashtag_line = " ".join(f"#{t.replace(' ', '')}" for t in tags[:6])
 
