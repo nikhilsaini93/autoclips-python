@@ -292,8 +292,12 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
         try:
             # Fast seek (-ss BEFORE -i): faster and avoids exit 255 errors 
             # if the timestamp is slightly past the end of the video.
-            run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path),
-                 "-frames:v", "1", str(frame_path)])
+            import subprocess
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path), "-frames:v", "1", str(frame_path)],
+                check=True,
+                capture_output=True
+            )
             return frame_path
         except Exception as e:
             logger.warning("Frame grab failed at t=%.1f: %s", t, e)
