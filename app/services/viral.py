@@ -4,13 +4,13 @@ import uuid
 
 from fastapi import HTTPException
 
-from app.config import CLIPS_DIR
+from app.config import CLIPS_DIR, settings
 from app.services.jobs import update_job
-from app.services.video.download import download_video, get_video_credit
+from app.services.video.download import download_video, get_video_credit, get_video_duration
 from app.services.video.gemini import find_viral_clips
 from app.services.video.ids import get_video_id
 from app.services.video.render import render_video
-from app.services.video.timeutils import time_to_seconds
+from app.services.video.timeutils import seconds_to_time, snap_to_silence, time_to_seconds
 from app.services.video.transcribe import (
     transcribe_words_english,
     transcribe_words_native,
@@ -51,14 +51,38 @@ def analyze_viral_clips(video_id: str, video_path, max_clips) -> list:
     description with Credit + Original link + fair-use disclaimer."""
     native = transcribe_words_native(video_id, video_path)
     detected_language = native.get("language")
-    transcript_text = words_to_transcript_text(native["words"])
-    logger.info("clip analysis language=%s video_id=%s", detected_language, video_id)
+    words = native.get("words") or []
+    segments = native.get("segments") or []
+    silences = native.get("silences") or []
+    transcript_text = words_to_transcript_text(words, segments=segments, silences=silences)
+    logger.info("clip analysis language=%s video_id=%s (%d words, %d segments, %d silences)",
+                detected_language, video_id, len(words), len(segments), len(silences))
     try:
         candidates = find_viral_clips(transcript_text, max_clips=max_clips, language=detected_language)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     if not candidates:
         raise HTTPException(422, "Gemini did not find any viral-worthy clips in this video")
+    try:
+        duration_sec = get_video_duration(video_path)
+    except Exception:
+        duration_sec = None
+    if settings.SNAP_TO_SILENCE and (words or segments or silences):
+        for c in candidates:
+            try:
+                raw_start = time_to_seconds(c["start"])
+                raw_end = time_to_seconds(c["end"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            ns, ne = snap_to_silence(
+                raw_start, raw_end, words=words, silences=silences, segments=segments,
+                window_sec=settings.SNAP_WINDOW_SEC, duration_sec=duration_sec,
+            )
+            if (ns, ne) != (raw_start, raw_end):
+                logger.info("Snapped clip '%s': [%.1f -> %.1f] to [%.1f -> %.1f]",
+                            c.get("title"), raw_start, raw_end, ns, ne)
+                c["start"] = seconds_to_time(ns)
+                c["end"] = seconds_to_time(ne)
     try:
         credit = get_video_credit(video_id) or ""
         for c in candidates:

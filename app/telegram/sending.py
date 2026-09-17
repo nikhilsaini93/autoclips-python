@@ -36,21 +36,58 @@ async def send_clip_to_telegram(
 
     chat_id = settings.TELEGRAM_CHAT_ID
 
+    # Generate metadata and save to text file alongside the video
     tags = [str(t).strip("# ").strip() for t in (hashtags or []) if str(t).strip("# ").strip()]
     hashtag_line = " ".join(f"#{t.replace(' ', '')}" for t in tags[:6])
 
-    caption = (
+    caption_full = (
         f"🎬 New Short Generated\n\n"
         f"🆔 Clip: {clip_id}\n"
         f"🔥 Viral Score: {score}\n\n"
         f"🎯 YT Title:\n{title or 'No title'}\n"
     )
     if hashtag_line:
-        caption += f"\n{hashtag_line}\n"
+        caption_full += f"\n{hashtag_line}\n"
     if description:
-        caption += f"\n📄 Description:\n{description.strip()}\n"
-    caption += f"\n💡 Reason:\n{reason or 'N/A'}"
+        caption_full += f"\n📄 Description:\n{description.strip()}\n"
+    caption_full += f"\n💡 Reason:\n{reason or 'N/A'}"
 
+    try:
+        text_path = Path(video_path).with_suffix('.txt')
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(caption_full)
+    except Exception:
+        logger.exception("Failed to write metadata file for %s", clip_id)
+
+    # Telegram Bot API videos are capped at ~50MB — skip gracefully instead
+    # of failing the whole batch when one clip is too large.
+    try:
+        size_mb = Path(video_path).stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0
+    # Oversize path also returns False — no buttons were attached.
+    if size_mb > 50:
+        logger.warning("Skipping Telegram send for %s (%.1f MB > 50MB limit)", clip_id, size_mb)
+        try:
+            warning_text = (
+                f"⚠️ Clip {clip_id} too large for Telegram ({size_mb:.1f} MB > 50MB).\n"
+                f"File kept at: {Path(video_path).name} (no Approve buttons — upload it manually).\n"
+                f"Text file saved at: {text_path.name}\n\n"
+                f"📝 Clip Metadata:\n{caption_full}"
+            )
+            # Telegram text limit is 4096, truncate if necessary
+            if len(warning_text) > 4000:
+                warning_text = warning_text[:4000] + "\n...[truncated]"
+
+            await telegram_bot.send_message(
+                chat_id=chat_id,
+                text=warning_text,
+            )
+        except TelegramError:
+            logger.exception("Failed to send too-large notice for %s", clip_id)
+        return False
+
+    caption = caption_full
     # Telegram video captions cap at 1024 chars — overflow goes as a reply.
     overflow = None
     if len(caption) > 1024:

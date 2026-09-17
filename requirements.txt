@@ -14,3 +14,7 @@ google-api-python-client==2.200.0
 google-auth-oauthlib==1.4.1
 google-auth-httplib2==0.4.2
 requests==2.31.0
+# T4 face pipeline: YOLOv8n-face on CUDA (falls back to YuNet/Res10 if missing).
+# NOTE: Colab already ships CUDA torch — install with `pip install -r requirements.txt`
+# and pip will reuse it; do NOT force a torch reinstall unless versions clash.
+ultralytics==8.3.40

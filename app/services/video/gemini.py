@@ -56,14 +56,17 @@ You are a professional YouTube Shorts editor.
 
 Analyze the transcript and find the best clips for standalone short-form videos.
 {language_instruction}
+Transcript format: each line is [startSec-endSec] one spoken sentence, with
+[pause Xs] markers where the speaker goes quiet. Use these to place cuts.
 Rules:
 - {count_instruction}
 - Duration between 20 and 60 seconds.
-- Strong hook.
-- Valuable insight.
-- High engagement potential.
-- Understandable without full context.
+- Strong hook in the first 2 seconds (question, bold claim, or payoff tease).
+- Valuable insight, high engagement potential, understandable without full context.
 - Clips must not overlap each other.
+- START each clip at a sentence start or right after a [pause]; END at a
+  sentence end or inside a [pause]. NEVER cut mid-word or mid-sentence —
+  move the boundary to the nearest sentence/pause edge instead.
 - Title: upload-ready YouTube Shorts title in HINGLISH (Roman script) ONLY, max ~60 characters, short, punchy, curiosity hook, no clickbait lies, no Devanagari, no pure-English.
 - Hashtags: 3-5 relevant tags in Hinglish/Roman script, lowercase, WITHOUT the '#' prefix.
 - Description: 2-3 engaging lines in HINGLISH (Roman script) ONLY — explain what the viewer will learn + why to watch. No Devanagari, no pure-English. Do NOT add credit/link/disclaimer (added automatically later).
@@ -96,7 +99,7 @@ Transcript:
     client = get_genai_client()
     last_error: Exception | None = None
     clips: list = []
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         try:
             response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             text = (response.text or "").strip()
@@ -148,9 +151,11 @@ Transcript:
             break
         except (ValueError, json.JSONDecodeError) as e:
             last_error = e
-            logger.warning("Gemini parse attempt %d/2 failed: %s", attempt, e)
+            logger.warning("Gemini parse attempt %d/3 failed: %s", attempt, e)
+            if attempt < 3:
+                time.sleep(2 ** attempt)
     if last_error is not None:
-        raise RuntimeError(f"Gemini returned unparseable JSON after 2 attempts: {last_error}")
+        raise RuntimeError(f"Gemini returned unparseable JSON after 3 attempts: {last_error}")
     if max_clips:
         clips = clips[:max_clips]
     logger.info("Gemini returned %d candidate clips in %.1fs", len(clips), time.perf_counter() - t0)

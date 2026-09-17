@@ -5,22 +5,34 @@ logger = logging.getLogger(__name__)
 
 
 def format_srt_timestamp(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int(round((seconds - int(seconds)) * 1000))
+    total_ms = max(0, int(round(max(0.0, seconds) * 1000)))
+    hours, rem = divmod(total_ms, 3600 * 1000)
+    minutes, rem = divmod(rem, 60 * 1000)
+    secs, millis = divmod(rem, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def chunk_words_for_captions(words: list, max_words: int = 3):
+def chunk_words_for_captions(words: list, max_words: int = 4, max_dur_sec: float = 1.6,
+                             min_dur_sec: float = 0.6):
+    """Sentence-aware caption chunks: at most max_words / max_dur_sec per line,
+    splitting early on sentence-ending punctuation so captions read naturally.
+    Short lines are padded to min_dur_sec for readability."""
     chunks = []
-    for i in range(0, len(words), max_words):
-        group = words[i:i + max_words]
-        start = group[0]["start"]
-        end = group[-1]["end"]
-        text = " ".join(w["text"] for w in group)
-        chunks.append((start, end, text))
+    buf = []
+    for w in words:
+        buf.append(w)
+        text = (w.get("text") or "")
+        sentence_end = text.endswith((".", "?", "!")) or text.endswith(("।",))
+        dur = buf[-1]["end"] - buf[0]["start"] if buf else 0.0
+        if len(buf) >= max_words or sentence_end or dur >= max_dur_sec:
+            start = buf[0]["start"]
+            end = max(buf[-1]["end"], start + min_dur_sec)
+            chunks.append((start, end, " ".join(b["text"] for b in buf)))
+            buf = []
+    if buf:
+        start = buf[0]["start"]
+        end = max(buf[-1]["end"], start + min_dur_sec)
+        chunks.append((start, end, " ".join(b["text"] for b in buf)))
     return chunks
 
 
