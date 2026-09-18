@@ -5,9 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     fonts-dejavu-core \
     fonts-noto-core \
     fontconfig \
+    && (command -v node >/dev/null 2>&1 || ln -sf /usr/bin/nodejs /usr/bin/node) \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
