@@ -44,7 +44,7 @@ def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> d
     v2 cache adds sentence segments + silence gaps for the silence snapper
     and the structured Gemini prompt; v1 caches (words-only) are upgraded
     on the fly so old Drive caches keep working."""
-    cache_key = f"{video_id}-{language or 'auto'}-{task}"
+    cache_key = f"{video_id}-{language or 'auto'}-{task}-m{settings.WHISPER_MODEL_SIZE}-v2"
     cache_path = TMP_DIR / f"{cache_key}-words.json"
     if cache_path.exists():
         try:
@@ -69,6 +69,8 @@ def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> d
     model = get_whisper_model()
     transcribe_kwargs: dict = dict(
         word_timestamps=True, language=language, task=task,
+        # Deterministic, sharper word timestamps for snap + burn alignment.
+        beam_size=5, best_of=5, temperature=0.0,
     )
     if settings.WHISPER_VAD_FILTER:
         transcribe_kwargs["vad_filter"] = True
@@ -133,6 +135,7 @@ def _ensure_v2_shape(result: dict) -> dict:
     result["segments"] = words_to_segments(words)
     result["silences"] = compute_silences(words)
     result.setdefault("cache_version", 2)
+    result.setdefault("model", settings.WHISPER_MODEL_SIZE)
     return result
 
 
@@ -215,17 +218,28 @@ def words_to_transcript_text(words: list, segments: list | None = None, silences
             text = (seg.get("text") or "").strip()
             if not text:
                 continue
-            # Attach pauses that fall between the previous segment end and this one.
+            # Attach pauses that fall between the previous segment end and this one,
+            # including ones straddling the boundary (ps < s < pe) which the
+            # old pe<=s check dropped.
             while sil_idx < len(silences):
                 try:
                     ps, pe = float(silences[sil_idx]["start"]), float(silences[sil_idx]["end"])
                 except (KeyError, TypeError, ValueError):
                     sil_idx += 1
                     continue
-                if pe <= s:
-                    if ps >= prev_end and pe - ps >= 0.3:
-                        lines.append(f"[pause {pe - ps:.1f}s]")
+                if pe <= prev_end:
                     sil_idx += 1
+                    continue
+                if ps < s:
+                    if pe - ps >= 0.3:
+                        # Clamp straddling pause display to the part before s.
+                        shown = min(pe, s) - max(ps, prev_end)
+                        if shown >= 0.3:
+                            lines.append(f"[pause {shown:.1f}s]")
+                    sil_idx += 1
+                    # If pause extends past s, don't consume next segment's pauses.
+                    if pe > s:
+                        break
                 else:
                     break
             lines.append(f"[{s:.1f}-{e:.1f}] {text}")

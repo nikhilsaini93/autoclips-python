@@ -67,6 +67,8 @@ def analyze_viral_clips(video_id: str, video_path, max_clips) -> list:
         duration_sec = get_video_duration(video_path)
     except Exception:
         duration_sec = None
+    max_dur = float(getattr(settings, "MAX_CLIP_DURATION_SEC", 60.0) or 60.0)
+    min_dur = float(getattr(settings, "MIN_CLIP_DURATION_SEC", 15.0) or 15.0)
     if settings.SNAP_TO_SILENCE and (words or segments or silences):
         for c in candidates:
             try:
@@ -83,6 +85,34 @@ def analyze_viral_clips(video_id: str, video_path, max_clips) -> list:
                             c.get("title"), raw_start, raw_end, ns, ne)
                 c["start"] = seconds_to_time(ns)
                 c["end"] = seconds_to_time(ne)
+    # Enforce duration guards + clamp overlong (Gemini sometimes returns
+    # 120s+ despite its 20-60s rule — those fail Telegram 50MB + FB 90s).
+    # Also clamp end to source duration so ffmpeg never gets a short file.
+    filtered: list = []
+    for c in candidates:
+        try:
+            ss, se = time_to_seconds(c["start"]), time_to_seconds(c["end"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if duration_sec is not None:
+            try:
+                se = min(se, float(duration_sec))
+            except (TypeError, ValueError):
+                pass
+        if se <= ss:
+            continue
+        if se - ss > max_dur:
+            logger.warning("Clamping overlong clip '%s' %.1fs -> %.1fs",
+                           c.get("title"), se - ss, max_dur)
+            se = ss + max_dur
+            c["end"] = seconds_to_time(se)
+        if se - ss < min(8.0, min_dur):
+            logger.warning("Dropping too-short clip '%s' %.1fs", c.get("title"), se - ss)
+            continue
+        filtered.append(c)
+    candidates = filtered
+    if not candidates:
+        raise HTTPException(422, "Gemini did not find any viral-worthy clips in this video")
     try:
         credit = get_video_credit(video_id) or ""
         for c in candidates:
@@ -155,12 +185,16 @@ async def generate_viral_clips(req, job_id: str | None = None):
     )
 
     entries = []
+    max_dur = float(getattr(settings, "MAX_CLIP_DURATION_SEC", 60.0) or 60.0)
 
+    # Pre-compute clamped ranges + re-snap to the *burn* words when english
+    # subs are used (native snap + english burn drifted 0.3-1s before).
+    jobs_list: list[tuple[int, dict, float, float, object]] = []
     for i, candidate in enumerate(candidates, start=1):
         try:
             start_sec = time_to_seconds(candidate["start"])
             end_sec = time_to_seconds(candidate["end"])
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             logger.warning(
                 "Skipping malformed candidate #%d (%s): %s",
                 i,
@@ -176,7 +210,36 @@ async def generate_viral_clips(req, job_id: str | None = None):
                 candidate,
             )
             continue
+        if end_sec - start_sec > max_dur:
+            logger.warning("Clamping viral clip #%d %.1fs -> %.1fs", i, end_sec - start_sec, max_dur)
+            end_sec = start_sec + max_dur
+            candidate["end"] = seconds_to_time(end_sec)
+        # Re-snap to burn words so cuts line up with what's actually burned.
+        if settings.SNAP_TO_SILENCE and subtitle_words and req.subtitles == "english":
+            try:
+                ns, ne = snap_to_silence(
+                    start_sec, end_sec, words=subtitle_words,
+                    silences=[], segments=[],
+                    window_sec=min(1.5, settings.SNAP_WINDOW_SEC + 0.5),
+                )
+                if ne > ns and abs(ns - start_sec) + abs(ne - end_sec) < 3.0:
+                    start_sec, end_sec = ns, ne
+            except Exception:
+                pass
+        output_path = (
+            CLIPS_DIR
+            / f"{video_id}-viral-{i}-{uuid.uuid4().hex[:8]}.mp4"
+        )
+        jobs_list.append((i, candidate, start_sec, end_sec, output_path))
 
+    # Render with bounded parallelism (2 at a time): 10-20min serial batch
+    # becomes ~2x faster without starving Whisper/CPU. Order preserved.
+    import asyncio as _asyncio
+
+    _sem = _asyncio.Semaphore(2)
+
+    async def _render_one(item):
+        i, candidate, start_sec, end_sec, output_path = item
         logger.info(
             "Rendering viral clip %d/%d: '%s' [%s -> %s] score=%s",
             i,
@@ -189,27 +252,34 @@ async def generate_viral_clips(req, job_id: str | None = None):
         _progress(f"rendering {i}/{len(candidates)}",
                     percent=75 + int(25 * (i - 1) / max(1, len(candidates))),
                     stage="rendering")
+        try:
+            await _asyncio.to_thread(
+                render_video,
+                video_path,
+                output_path,
+                start_sec,
+                end_sec,
+                words=subtitle_words,
+                vertical_crop=req.vertical_crop,
+            )
+        except Exception:
+            logger.exception("Render failed for clip %s-%d, continuing batch", video_id, i)
+            return None
+        return (i, candidate, start_sec, end_sec, output_path)
 
-        output_path = (
-            CLIPS_DIR
-            / f"{video_id}-viral-{i}-{uuid.uuid4().hex[:8]}.mp4"
-        )
+    async def _guarded(item):
+        async with _sem:
+            return await _render_one(item)
 
-        await asyncio.to_thread(
-            render_video,
-            video_path,
-            output_path,
-            start_sec,
-            end_sec,
-            words=subtitle_words,
-            vertical_crop=req.vertical_crop,
-        )
-
+    rendered = await _asyncio.gather(*[_guarded(j) for j in jobs_list])
+    for item in sorted([r for r in rendered if r is not None], key=lambda x: x[0]):
+        i, candidate, start_sec, end_sec, output_path = item
         entries.append({
             "path": output_path,
             "title": candidate.get("title"),
             "start": candidate.get("start"),
             "end": candidate.get("end"),
+            "duration_seconds": round(end_sec - start_sec, 1),
             "score": candidate.get("score"),
             "reason": candidate.get("reason"),
             "hashtags": candidate.get("hashtags") or [],

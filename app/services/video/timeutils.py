@@ -1,15 +1,37 @@
 def time_to_seconds(time_str) -> float:
     """Accepts 'HH:MM:SS', 'MM:SS', or a plain number of seconds."""
     if isinstance(time_str, (int, float)):
-        return float(time_str)
-    parts = [float(p) for p in str(time_str).split(":")]
-    if len(parts) == 3:
-        h, m, s = parts
-        return h * 3600 + m * 60 + s
-    if len(parts) == 2:
-        m, s = parts
-        return m * 60 + s
-    return parts[0]
+        v = float(time_str)
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError(f"invalid time value: {time_str!r}")
+        return v
+    s = str(time_str).strip()
+    if not s:
+        raise ValueError(f"invalid time value: {time_str!r}")
+    # Plain seconds (also covers "90", "90.5").
+    if ":" not in s:
+        try:
+            v = float(s)
+        except ValueError:
+            raise ValueError(f"invalid time value: {time_str!r}")
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError(f"invalid time value: {time_str!r}")
+        return v
+    parts = s.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"invalid time value: {time_str!r}")
+    try:
+        nums = [float(p.strip()) for p in parts]
+    except ValueError:
+        raise ValueError(f"invalid time value: {time_str!r}")
+    for v in nums:
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError(f"invalid time value: {time_str!r}")
+    if len(nums) == 3:
+        h, m, s_ = nums
+        return h * 3600 + m * 60 + s_
+    m, s_ = nums
+    return m * 60 + s_
 
 
 def snap_to_silence(start_sec: float, end_sec: float, words: list | None = None,
@@ -27,42 +49,65 @@ def snap_to_silence(start_sec: float, end_sec: float, words: list | None = None,
     silences = silences or []
     segments = segments or []
 
-    def _nearest_word_edge(t: float) -> float:
+    # Pre-extract sorted edges once (was O(words*candidates) linear scan per
+    # boundary — slow on 10k-word videos).
+    word_edges: list[float] = []
+    for w in words:
+        for k in ("start", "end"):
+            try:
+                word_edges.append(float(w[k]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    word_edges.sort()
+    seg_edges: list[float] = []
+    for seg in segments:
+        for k in ("start", "end"):
+            try:
+                seg_edges.append(float(seg[k]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    seg_edges.sort()
+    silence_spans: list[tuple[float, float, float]] = []
+    for s in silences:
+        try:
+            ss, se = float(s["start"]), float(s["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if se > ss:
+            silence_spans.append((ss, se, (ss + se) / 2.0))
+
+    import bisect
+
+    def _nearest_sorted(t: float, edges: list[float]) -> float:
+        if not edges:
+            return t
+        i = bisect.bisect_left(edges, t)
         best, best_d = t, window_sec + 1e-9
-        for w in words:
-            for k in ("start", "end"):
-                try:
-                    e = float(w[k])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                d = abs(e - t)
+        for j in (i - 1, i):
+            if 0 <= j < len(edges):
+                d = abs(edges[j] - t)
                 if d < best_d:
-                    best, best_d = e, d
+                    best, best_d = edges[j], d
         return best if best_d <= window_sec else t
+
+    def _nearest_word_edge(t: float) -> float:
+        return _nearest_sorted(t, word_edges)
 
     def _prefer_sentence_or_silence(t: float, edge: float) -> float:
         # Sentence ends win: a boundary near a sentence end should sit exactly there.
         best, best_d = edge, abs(edge - t)
-        for seg in segments:
-            for k in ("start", "end"):
-                try:
-                    e = float(seg[k])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                d = abs(e - t)
-                if d <= window_sec and d < best_d:
-                    best, best_d = e, d
-        # Silences win over raw word edges: sit in the middle of the pause.
-        for s in silences:
-            try:
-                ss, se = float(s["start"]), float(s["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            mid = (ss + se) / 2.0
+        cand = _nearest_sorted(t, seg_edges)
+        if cand != t and abs(cand - t) <= window_sec and abs(cand - t) < best_d:
+            best, best_d = cand, abs(cand - t)
+        # Silences win over raw word edges: sit in the middle of the pause —
+        # but only when the pause is within the snap window (old code jumped
+        # up to 5s into a long music break ignoring window_sec).
+        for ss, se, mid in silence_spans:
             if abs(mid - t) <= window_sec and abs(mid - t) < best_d:
                 best, best_d = mid, abs(mid - t)
-            # Boundary sitting inside a pause already: center it.
-            if ss - 1e-6 <= t <= se + 1e-6:
+            # Boundary already inside a pause: center it, but only if the
+            # pause itself is near (within window of t) to avoid huge jumps.
+            if ss - 1e-6 <= t <= se + 1e-6 and (se - ss) / 2.0 <= window_sec + 1.0:
                 return mid
         return best
 

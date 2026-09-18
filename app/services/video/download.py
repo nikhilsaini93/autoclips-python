@@ -17,8 +17,24 @@ def download_video(video_id: str) -> Path:
     """Downloads (once) and caches the source video on disk, keyed by video_id."""
     output_path = DOWNLOAD_DIR / f"{video_id}.mp4"
     if output_path.exists():
-        logger.info("Using cached download for video_id=%s (%s)", video_id, output_path)
-        return output_path
+        try:
+            # Corrupt/partial downloads (killed container, 0-byte file) were
+            # reused forever — validate size + stream before trusting cache.
+            if output_path.stat().st_size > 1024 * 1024:
+                get_video_dimensions(output_path)
+                logger.info("Using cached download for video_id=%s (%s)", video_id, output_path)
+                return output_path
+            logger.warning("Cached download %s too small, re-downloading", output_path)
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        except Exception:
+            logger.warning("Cached download %s unreadable, re-downloading", output_path)
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
 
     logger.info("Downloading video_id=%s via yt-dlp...", video_id)
     t0 = time.perf_counter()
@@ -28,11 +44,13 @@ def download_video(video_id: str) -> Path:
     if cookies:
         command += ["--cookies", cookies]
     command += [
-        # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
-        # which matters since clips get re-decoded multiple times
-        # (face-detection frame grabs + the final cut/subtitle burn)
-        "-f", "bv*[vcodec^=avc1]+ba/bv*+ba/b",
+        # Best quality up to 1080p with H.264 preference for fast CPU decode,
+        # but allow VP9/AV1 fallback instead of capping to avc1-only 720p.
+        # Height floor keeps the 9:16 upscale from amplifying a 360p source.
+        "-f", "bv*[height<=1080][vcodec^=avc1]+ba/bv*[height<=1080]+ba/bv*+ba/b",
+        "--format-sort", "res:1080,fps,vcodec:avc1,acodec:aac",
         "--merge-output-format", "mp4",
+        "--continue", "--retries", "3",
         "-o", str(output_path),
         url,
     ]
@@ -98,13 +116,39 @@ def get_video_credit(video_id: str) -> str:
 
 
 def get_video_dimensions(input_path: Path):
-    output = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(input_path)],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    width, height = map(int, output.split(","))
-    return width, height
+    try:
+        output = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(input_path)],
+            capture_output=True, text=True, check=True, timeout=15,
+        ).stdout.strip()
+        width, height = map(int, output.split(","))
+        if width <= 0 or height <= 0:
+            raise ValueError(f"invalid dimensions: {output}")
+        return width, height
+    except Exception as e:
+        # Portrait phone video with a rotate tag reports swapped dims —
+        # try honoring rotation before giving up so crop math stays correct.
+        try:
+            output = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,side_data_list",
+                 "-of", "default=noprint_wrappers=1", str(input_path)],
+                capture_output=True, text=True, check=True, timeout=15,
+            ).stdout
+            import re
+            wm = re.search(r"width=(\d+)", output)
+            hm = re.search(r"height=(\d+)", output)
+            if wm and hm:
+                w, h = int(wm.group(1)), int(hm.group(1))
+                if "rotation" in output.lower() and abs(w - h) > 0:
+                    # 90/270 deg rotation swaps display dims.
+                    return h, w
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
+        raise RuntimeError(f"ffprobe dimensions failed for {input_path}: {e}")
 
 
 def get_video_duration(input_path: Path) -> float:

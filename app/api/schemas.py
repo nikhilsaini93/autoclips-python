@@ -26,7 +26,7 @@ class ClipRequest(BaseModel):
 class AnalyzeClipsRequest(BaseModel):
     url: str = Field(..., description="YouTube video URL")
     max_clips: Optional[int] = Field(
-        None, ge=1, description="Cap the number of clips. Omit to let the AI decide the count entirely on its own."
+        None, ge=1, le=20, description="Cap the number of clips. Omit to let the AI decide the count entirely on its own."
     )
 
 
@@ -35,7 +35,7 @@ class ViralClipInfo(BaseModel):
     start: str
     end: str
     duration_seconds: float
-    score: Optional[float] = None
+    score: Optional[float] = Field(default=None, ge=0, le=100)
     reason: Optional[str] = None
     hashtags: List[str] = Field(default_factory=list)
     description: Optional[str] = None
@@ -44,7 +44,7 @@ class ViralClipInfo(BaseModel):
 class ViralClipsRequest(BaseModel):
     url: str = Field(..., description="YouTube video URL")
     max_clips: Optional[int] = Field(
-        None, ge=1, description="Cap the number of clips. Omit to get every viral-worthy clip Gemini finds (typically 6-10)."
+        None, ge=1, le=20, description="Cap the number of clips. Omit to get every viral-worthy clip Gemini finds (typically 6-10)."
     )
     vertical_crop: bool = Field(True, description="Crop each clip to 9:16 vertical using face detection")
     subtitles: Literal["none", "english", "native"] = Field(

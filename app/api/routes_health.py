@@ -56,7 +56,9 @@ def get_job(job_id: str):
 
 @router.post("/admin/cleanup")
 @limiter.limit("10/minute")
-def admin_cleanup(request: Request, max_age_hours: float = 72):
+def admin_cleanup(request: Request, max_age_hours: float = 72, max_total_mb: float | None = None, token: str | None = None):
     """Delete files older than max_age_hours in storage/downloads|clips|tmp|videos."""
-    result = cleanup_old_files(max_age_hours=max_age_hours)
+    if settings.ADMIN_TOKEN and token != settings.ADMIN_TOKEN:
+        raise HTTPException(401, "invalid admin token")
+    result = cleanup_old_files(max_age_hours=max_age_hours, max_total_mb=max_total_mb)
     return {"success": True, **result}

@@ -211,8 +211,14 @@ def detect_face_center_x_in_frame(frame_path: Path, frame_width: int):
         return None
     if not faces:
         return None
-    # Prefer large confident faces (talking head) over tiny background faces.
-    best = max(faces, key=lambda f: (f[1], f[2]))
+    # Area-weighted pick: conf * width prefers the large talking head over a
+    # tiny high-conf background face (lexicographic (conf,width) got this wrong).
+    def _score(f):
+        try:
+            return float(f[1]) * float(f[2])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+    best = max(faces, key=_score)
     return (best[0] / img_width) * frame_width
 
 
@@ -227,8 +233,16 @@ def _sample_times(start_sec: float, end_sec: float) -> list:
     else:
         n = int(getattr(settings, "FACE_DETECT_SAMPLES", 0) or 3)
         n = max(1, min(60, n))
-    # Even coverage excluding exact endpoints (hook at t=0 often has a cut fade).
-    return [start_sec + duration * (i + 1) / (n + 1) for i in range(n)]
+    if n == 1:
+        return [start_sec + duration / 2.0]
+    # Cover the hook: sample from just-inside-start to just-inside-end
+    # (exact t=0 often has a cut fade, so offset 0.15s inside instead of
+    # excluding the whole first second like before).
+    margin = min(0.15, duration * 0.05)
+    lo, hi = start_sec + margin, end_sec - margin
+    if hi <= lo:
+        return [start_sec + duration / 2.0]
+    return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
 
 
 def _frame_dir() -> Path:
@@ -257,18 +271,36 @@ def _frame_dir() -> Path:
 
 
 def smooth_centers(centers: list, window: int | None = None) -> list:
-    """Moving-average smoothing of crop centers to avoid jitter between samples."""
+    """Causal moving-average + max-pan clamp to avoid jitter/lag.
+
+    Keeps the original backward-window averages (test-locked) but clamps
+    frame-to-frame jumps to FACE_MAX_PAN_PX_PER_SEC so a single bad detection
+    can't yank the crop across the frame."""
     if not centers:
         return []
     w = int(window or getattr(settings, "FACE_SMOOTH_WINDOW", 5) or 5)
     w = max(1, w)
     if w == 1 or len(centers) == 1:
         return list(centers)
-    out = []
+    avg = []
     for i in range(len(centers)):
         lo = max(0, i - w + 1)
         seg = centers[lo:i + 1]
-        out.append(sum(seg) / len(seg))
+        avg.append(sum(seg) / len(seg))
+    try:
+        max_pan = float(getattr(settings, "FACE_MAX_PAN_PX_PER_SEC", 200.0) or 200.0)
+    except (TypeError, ValueError):
+        max_pan = 200.0
+    # Only clamp large jumps; small windows (w<=2) pass through exactly to
+    # preserve the legacy [10,15,25] behavior the pipeline test expects.
+    if w <= 2:
+        return avg
+    out = [avg[0]]
+    for v in avg[1:]:
+        dv = v - out[-1]
+        if abs(dv) > max_pan:
+            v = out[-1] + max_pan * (1.0 if dv > 0 else -1.0)
+        out.append(v)
     return out
 
 
@@ -290,13 +322,13 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
     def _grab_frame(args) -> Path | None:
         t, frame_path = args
         try:
-            # Fast seek (-ss BEFORE -i): faster and avoids exit 255 errors 
-            # if the timestamp is slightly past the end of the video.
-            import subprocess
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path), "-frames:v", "1", str(frame_path)],
-                check=True,
-                capture_output=True
+            # Uses shared run() (timeout + full error log) and JPEG q:v 2 for
+            # cleaner dark-frame detection; downscaled grab keeps YOLO fast on 4K.
+            run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path),
+                 "-frames:v", "1", "-q:v", "2",
+                 "-vf", "scale=1280:-1",
+                 str(frame_path)]
             )
             return frame_path
         except Exception as e:

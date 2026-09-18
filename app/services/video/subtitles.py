@@ -12,28 +12,61 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def chunk_words_for_captions(words: list, max_words: int = 4, max_dur_sec: float = 1.6,
-                             min_dur_sec: float = 0.6):
-    """Sentence-aware caption chunks: at most max_words / max_dur_sec per line,
-    splitting early on sentence-ending punctuation so captions read naturally.
-    Short lines are padded to min_dur_sec for readability."""
+def chunk_words_for_captions(words: list, max_words: int = 4, max_dur_sec: float = 1.8,
+                             min_dur_sec: float = 0.9, max_chars: int = 42):
+    """Sentence-aware caption chunks: at most max_words / max_chars /
+    max_dur_sec per line, splitting early on sentence-ending punctuation
+    so captions read naturally and never wrap to 3 lines on a 1080px crop.
+    Chunks never overlap: each start is clamped to the previous end, and
+    short lines are padded to min_dur_sec (capped by the next word start)
+    for readability at ~160wpm."""
     chunks = []
     buf = []
+    buf_chars = 0
+    prev_end: float | None = None
     for w in words:
-        buf.append(w)
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if we <= ws:
+            continue
         text = (w.get("text") or "")
-        sentence_end = text.endswith((".", "?", "!")) or text.endswith(("।",))
+        # Clamp to previous chunk so SRT times never overlap/flicker.
+        if prev_end is not None:
+            ws = max(ws, prev_end)
+            if we <= ws:
+                continue
+        buf.append({"start": ws, "end": we, "text": text})
+        buf_chars += len(text) + 1
+        sentence_end = text.endswith((".", "?", "!", "…")) or text.endswith(("।",))
         dur = buf[-1]["end"] - buf[0]["start"] if buf else 0.0
-        if len(buf) >= max_words or sentence_end or dur >= max_dur_sec:
+        if len(buf) >= max_words or sentence_end or dur >= max_dur_sec or buf_chars >= max_chars:
             start = buf[0]["start"]
             end = max(buf[-1]["end"], start + min_dur_sec)
+            # Don't hang a single short word: cap padding at natural end + 0.4s
+            # when the line is far shorter than min_dur.
+            if len(buf) == 1 and buf[-1]["end"] - buf[0]["start"] < 0.4:
+                end = min(end, buf[-1]["end"] + 0.4)
             chunks.append((start, end, " ".join(b["text"] for b in buf)))
+            prev_end = end
             buf = []
+            buf_chars = 0
     if buf:
-        start = buf[0]["start"]
-        end = max(buf[-1]["end"], start + min_dur_sec)
-        chunks.append((start, end, " ".join(b["text"] for b in buf)))
-    return chunks
+        start = buf[0]["start"] if prev_end is None else max(buf[0]["start"], prev_end)
+        end = max(buf[-1]["end"], start + min(min_dur_sec, 1.2))
+        if end > start:
+            chunks.append((start, end, " ".join(b["text"] for b in buf)))
+    # Final safety: enforce strictly increasing, non-overlapping times.
+    fixed = []
+    last_end = -1.0
+    for s, e, t in chunks:
+        s = max(s, last_end + 0.001) if fixed else s
+        if e <= s:
+            continue
+        fixed.append((s, e, t))
+        last_end = e
+    return fixed
 
 
 def write_srt(words: list, start_sec: float, end_sec: float, srt_path: Path) -> bool:
@@ -42,10 +75,18 @@ def write_srt(words: list, start_sec: float, end_sec: float, srt_path: Path) -> 
     clip_duration = end_sec - start_sec
     clip_words = []
     for w in words:
-        if w["end"] <= start_sec or w["start"] >= end_sec:
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
             continue
-        rel_start = max(0.0, w["start"] - start_sec)
-        rel_end = min(clip_duration, w["end"] - start_sec)
+        if we <= start_sec or ws >= end_sec:
+            continue
+        rel_start = max(0.0, ws - start_sec)
+        rel_end = min(clip_duration, we - start_sec)
+        # Drop sub-150ms edge slivers (word straddling the cut) — they render
+        # as a 1-frame flash caption at head/tail.
+        if rel_end - rel_start < 0.15:
+            continue
         if rel_end <= rel_start:
             continue
         clip_words.append({"start": rel_start, "end": rel_end, "text": w["text"]})

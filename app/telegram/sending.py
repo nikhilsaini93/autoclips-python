@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import RetryAfter, TelegramError, TimedOut
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
 from app.config import settings
 from app.services.approvals import pending_uploads, register_pending_upload
@@ -59,18 +59,35 @@ async def send_clip_to_telegram(
     except Exception:
         logger.exception("Failed to write metadata file for %s", clip_id)
 
-    # Telegram Bot API videos are capped at ~50MB — skip gracefully instead
-    # of failing the whole batch when one clip is too large.
+    # Telegram Bot API videos are capped (~50MB default, configurable) — try to
+    # recompress first, then skip gracefully instead of failing the whole batch.
     try:
         size_mb = Path(video_path).stat().st_size / (1024 * 1024)
     except OSError:
         size_mb = 0
+    cap_mb = float(getattr(settings, "TELEGRAM_MAX_VIDEO_MB", 50.0) or 50.0)
+    if size_mb > cap_mb:
+        # Best-effort recompress before giving up (unit tests patch this to
+        # False to exercise the skip path).
+        try:
+            from app.services.video.render import compress_for_telegram
+            try:
+                compress_for_telegram(Path(video_path))
+            except Exception:
+                logger.exception("Recompress attempt failed for %s", clip_id)
+            try:
+                size_mb = Path(video_path).stat().st_size / (1024 * 1024)
+            except OSError:
+                pass
+        except Exception:
+            logger.exception("Oversize check failed for %s", clip_id)
     # Oversize path also returns False — no buttons were attached.
-    if size_mb > 50:
-        logger.warning("Skipping Telegram send for %s (%.1f MB > 50MB limit)", clip_id, size_mb)
+    if size_mb > cap_mb:
+        logger.warning("Skipping Telegram send for %s (%.1f MB > %.1fMB limit)", clip_id, size_mb, cap_mb)
         try:
             warning_text = (
-                f"⚠️ Clip {clip_id} too large for Telegram ({size_mb:.1f} MB > 50MB).\n"
+                f"⚠️ Clip {clip_id} too large for Telegram ({size_mb:.1f} MB > {cap_mb:.1f} MB, "
+                f"Telegram 50 MB limit).\n"
                 f"File kept at: {Path(video_path).name} (no Approve buttons — upload it manually).\n"
                 f"Text file saved at: {text_path.name}\n\n"
                 f"📝 Clip Metadata:\n{caption_full}"
@@ -155,6 +172,7 @@ async def send_clip_to_telegram(
         keyboard = InlineKeyboardMarkup(rows)
 
     sent = False
+    too_large_api = False
     for attempt in (1, 2, 3):
         try:
             with open(video_path, "rb") as video:
@@ -173,6 +191,15 @@ async def send_clip_to_telegram(
         except TimedOut:
             logger.warning("Telegram send timed out for %s (attempt %d/3)", clip_id, attempt)
             await asyncio.sleep(5)
+        except NetworkError as e:
+            # "Request Entity Too Large" is a size rejection, not a transient
+            # network blip — don't retry pointlessly, tell the truth.
+            if "too large" in str(e).lower() or "entity" in str(e).lower():
+                logger.warning("Telegram rejected %s as too large: %s", clip_id, e)
+                too_large_api = True
+                break
+            logger.exception("Telegram network error for clip %s", clip_id)
+            break
         except TelegramError:
             logger.exception("Failed to send clip %s to Telegram", clip_id)
             break
@@ -183,11 +210,18 @@ async def send_clip_to_telegram(
         for tok in tokens.values():
             pending_uploads.pop(tok, None)
         try:
-            await telegram_bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Could not deliver {clip_id} to Telegram (network timeout).\n"
-                     f"File kept at: clips/{Path(video_path).name}",
-            )
+            if too_large_api:
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Clip {clip_id} rejected by Telegram as too large (Telegram 50 MB limit).\n"
+                         f"File kept at: clips/{Path(video_path).name} — upload it manually.",
+                )
+            else:
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Could not deliver {clip_id} to Telegram (network timeout).\n"
+                         f"File kept at: clips/{Path(video_path).name}",
+                )
         except TelegramError:
             pass
         return False

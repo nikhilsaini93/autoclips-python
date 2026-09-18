@@ -28,6 +28,21 @@ class Settings(BaseSettings):
     WHISPER_SPEECH_PAD_MS: int = 200
 
     FFMPEG_PRESET: str = "veryfast"
+    # Bounded H.264 encode: keeps 60-170s clips under the Telegram Bot API
+    # ~50MB sendVideo cap without blocky defaults (x264 crf23 veryfast).
+    RENDER_CRF: int = 20
+    RENDER_AUDIO_BITRATE: str = "128k"
+    RENDER_FPS: int = 30
+    # Telegram Bot API sendVideo cap (paid/local Bot API allows up to 2GB —
+    # raise this via env instead of code change).
+    TELEGRAM_MAX_VIDEO_MB: float = 50.0
+    # Viral clip length guard: Gemini is prompted 20-60s but occasionally
+    # returns 120s+ picks that fail Telegram 50MB + FB 90s — clamp in viral flow.
+    MAX_CLIP_DURATION_SEC: float = 60.0
+    MIN_CLIP_DURATION_SEC: float = 15.0
+    # Optional token guarding POST /admin/cleanup (empty = open, for backwards
+    # compat — set it to require ?token=...).
+    ADMIN_TOKEN: str = ""
     LOG_LEVEL: str = "INFO"
     YOUTUBE_COOKIES_FILE: str = ""
 
