@@ -10,6 +10,13 @@ def run(command: list, timeout: float | None = 600) -> None:
     t0 = time.perf_counter()
     try:
         subprocess.run(command, check=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # Slow CPU encodes (1080x1920 software x264) can take 10x realtime —
+        # log which command hit the wall instead of a bare traceback.
+        partial = (e.stderr or b"")[-2000:].decode(errors="ignore") if e.stderr else ""
+        logger.error("Command timed out after %ss (%s): %s\n%s",
+                     e.timeout, command[0], " ".join(command), partial)
+        raise
     except subprocess.CalledProcessError as e:
         # Keep head (input errors: crop>width, subtitles font) + tail
         # (encode errors) — tail-only truncation hid the real cause.

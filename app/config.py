@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     WHISPER_SPEECH_PAD_MS: int = 200
 
     FFMPEG_PRESET: str = "veryfast"
+    # Render timeout: 0 = auto (max(600s, 30x clip duration) — slow CPU
+    # software-x264 needs ~10x realtime for 1080x1920 + libass + loudnorm,
+    # and viral batches run 2 encodes in parallel). Set an explicit seconds
+    # value to override (production TimeoutExpired 2026-09-18: 56s clip
+    # killed by the old flat 600s cap on loaded Colab CPU).
+    RENDER_TIMEOUT_SEC: float = 0.0
     # Bounded H.264 encode: keeps 60-170s clips under the Telegram Bot API
     # ~50MB sendVideo cap without blocky defaults (x264 crf23 veryfast).
     RENDER_CRF: int = 20

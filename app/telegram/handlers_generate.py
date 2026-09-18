@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 async def run_ai_generation(query, context):
     url = context.user_data.get("youtube_url")
     max_clips = context.user_data.get("max_clips")
-    subtitles = context.user_data.get("subtitles", "native")
+    subtitles = context.user_data.get("subtitles", "hinglish")
 
     if not url:
         await query.edit_message_text(
@@ -114,7 +114,7 @@ async def run_ai_generation(query, context):
 async def run_timestamp_generation(query, context):
     url = context.user_data.get("youtube_url")
     timestamp = context.user_data.get("timestamp")
-    subtitles = context.user_data.get("subtitles", "native")
+    subtitles = context.user_data.get("subtitles", "hinglish")
 
     if not url or not timestamp:
         await query.edit_message_text(

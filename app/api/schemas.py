@@ -18,8 +18,8 @@ class ClipRequest(BaseModel):
     start: str = Field(..., description="Start time — 'HH:MM:SS', 'MM:SS', or seconds")
     end: str = Field(..., description="End time — 'HH:MM:SS', 'MM:SS', or seconds")
     vertical_crop: bool = Field(True, description="Crop to 9:16 vertical using face detection")
-    subtitles: Literal["none", "english", "native"] = Field(
-        "none", description="Burn subtitles into the clip: none, english (translated), or native (as spoken)"
+    subtitles: Literal["none", "english", "native", "hinglish"] = Field(
+        "hinglish", description="Burn subtitles: none, english (translated), native (as spoken), or hinglish (as spoken, Latin script)"
     )
 
 
@@ -47,6 +47,6 @@ class ViralClipsRequest(BaseModel):
         None, ge=1, le=20, description="Cap the number of clips. Omit to get every viral-worthy clip Gemini finds (typically 6-10)."
     )
     vertical_crop: bool = Field(True, description="Crop each clip to 9:16 vertical using face detection")
-    subtitles: Literal["none", "english", "native"] = Field(
-        "english", description="Burn subtitles into each clip: none, english (translated), or native (as spoken)"
+    subtitles: Literal["none", "english", "native", "hinglish"] = Field(
+        "hinglish", description="Burn subtitles: none, english (translated), native (as spoken), or hinglish (as spoken, Latin script)"
     )

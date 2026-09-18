@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--video", default="", help="Local video path (skips download).")
     p.add_argument("--start", required=True, help="Clip start: HH:MM:SS, MM:SS, or seconds.")
     p.add_argument("--end", required=True, help="Clip end: HH:MM:SS, MM:SS, or seconds.")
-    p.add_argument("--subtitles", default="none", choices=["none", "english", "native"],
+    p.add_argument("--subtitles", default="none", choices=["none", "english", "native", "hinglish"],
                    help="Burned-in subs. 'none' skips Whisper (fastest YOLO test).")
     p.add_argument("--face-model", default="yolo", choices=["yolo", "yunet", "res10"],
                    help="Detector under test (default yolo).")

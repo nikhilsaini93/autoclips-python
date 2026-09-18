@@ -10,8 +10,10 @@ from app.services.video.download import download_video, get_video_credit, get_vi
 from app.services.video.gemini import find_viral_clips
 from app.services.video.ids import get_video_id
 from app.services.video.render import render_video
+from app.services.video.romanize import to_hinglish_words
 from app.services.video.timeutils import seconds_to_time, snap_to_silence, time_to_seconds
 from app.services.video.transcribe import (
+    peek_cached_transcript,
     transcribe_words_english,
     transcribe_words_native,
     words_to_transcript_text,
@@ -31,15 +33,30 @@ def prepare(url: str):
 
 
 def subtitle_label(value: str) -> str:
-    return {"english": "English", "native": "Native", "none": "NO"}.get(value, value)
+    return {"english": "English", "native": "Native", "hinglish": "Hinglish", "none": "NO"}.get(value, value)
 
 
 def resolve_subtitle_words(video_id: str, video_path, subtitles: str):
     """Returns word list for burning, or None. 'native' reuses the
     as-spoken transcript (timestamps align exactly with clip boundaries);
-    'english' uses Whisper's translate task."""
+    'english' uses Whisper's translate task; 'hinglish' is the native words
+    romanized to Latin script (same timings — Hindi audio reads as Hinglish,
+    English audio passes through untouched)."""
     if subtitles == "english":
+        # No translate pass when the audio is already English: the native
+        # transcript (always built + cached by analyze/viral flows, carrying
+        # the detected language) is reused with exact native timings.
+        # Peek only — never transcribes here, so first-time /clip calls keep
+        # today's single-pass behavior.
+        cached_native = peek_cached_transcript(video_id, task="transcribe")
+        if cached_native and (cached_native.get("language") or "").lower().startswith("en"):
+            if cached_native.get("words"):
+                logger.info("Audio already English — reusing native transcript, "
+                            "skipping Whisper translate pass for video_id=%s", video_id)
+                return cached_native["words"]
         return transcribe_words_english(video_id, video_path)
+    if subtitles == "hinglish":
+        return to_hinglish_words(transcribe_words_native(video_id, video_path)["words"])
     if subtitles == "native":
         return transcribe_words_native(video_id, video_path)["words"]
     return None

@@ -37,8 +37,9 @@ def test_render_passes_bounded_encode_flags(tmp_path, monkeypatch):
 
     monkeypatch.setattr(render_mod, "get_video_dimensions", lambda _: (1920, 1080))
 
-    def fake_run(cmd):
+    def fake_run(cmd, **kwargs):
         seen["cmd"] = list(cmd)
+        seen["timeout"] = kwargs.get("timeout")
         out.write_bytes(b"video")
 
     monkeypatch.setattr(render_mod, "run", fake_run)
@@ -66,7 +67,7 @@ def test_render_recompresses_oversize_output(tmp_path, monkeypatch):
 
     monkeypatch.setattr(render_mod, "get_video_dimensions", lambda _: (1920, 1080))
     monkeypatch.setattr(
-        render_mod, "run", lambda cmd: out.write_bytes(b"video")
+        render_mod, "run", lambda cmd, **kwargs: out.write_bytes(b"video")
     )
     monkeypatch.setattr(render_mod, "is_over_telegram_limit", lambda _p: True)
     monkeypatch.setattr(
@@ -75,6 +76,41 @@ def test_render_recompresses_oversize_output(tmp_path, monkeypatch):
 
     render_mod.render_video(src, out, 0.0, 60.0, vertical_crop=False)
     assert calls == [out]
+
+
+def test_render_passes_scaled_timeout(tmp_path, monkeypatch):
+    """Production 2026-09-18: a 56s 1080x1920 CPU encode was killed by the
+    old flat 600s cap. Budgets must scale with duration."""
+    import app.services.video.render as render_mod
+
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"fake")
+    out = tmp_path / "clip.mp4"
+    seen = {}
+
+    monkeypatch.setattr(render_mod, "get_video_dimensions", lambda _: (1920, 1080))
+
+    def fake_run(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        out.write_bytes(b"video")
+
+    monkeypatch.setattr(render_mod, "run", fake_run)
+    monkeypatch.setattr(render_mod, "is_over_telegram_limit", lambda _p: False)
+
+    render_mod.render_video(src, out, 721.0, 777.0, vertical_crop=False)  # 56s clip
+    assert seen["timeout"] == 56.0 * 30.0  # 1680s, not the old flat 600s
+
+
+def test_render_timeout_sec_helper(monkeypatch):
+    from app.config import settings
+    from app.services.video.render import render_timeout_sec
+
+    monkeypatch.setattr(settings, "RENDER_TIMEOUT_SEC", 0.0)
+    assert render_timeout_sec(10.0) == 600.0  # floor for short clips
+    assert render_timeout_sec(56.0) == 1680.0  # 30x duration
+    assert render_timeout_sec(0) == 600.0  # invalid duration falls back safely
+    monkeypatch.setattr(settings, "RENDER_TIMEOUT_SEC", 999.0)
+    assert render_timeout_sec(56.0) == 999.0  # explicit override wins
 
 
 def test_viral_clamps_overlong_candidate(monkeypatch, tmp_path):

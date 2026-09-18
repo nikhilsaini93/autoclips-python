@@ -8,6 +8,7 @@ from pathlib import Path
 from app.config import TMP_DIR, settings
 from app.services.video.download import get_video_dimensions
 from app.services.video.faces import detect_face_center_x
+from app.services.video.fonts import warn_if_glyphs_missing
 from app.services.video.process import run
 from app.services.video.subtitles import write_srt
 
@@ -24,6 +25,27 @@ def target_video_maxrate_kbps(duration_sec: float, audio_kbps: int = 128) -> int
     duration_sec = max(1.0, float(duration_sec or 1.0))
     budget = (cap_mb * 8192.0 / duration_sec - float(audio_kbps)) * 0.85
     return int(max(500, min(2500, round(budget))))
+
+
+def render_timeout_sec(duration_sec: float) -> float:
+    """ffmpeg budget for one clip encode.
+
+    Auto mode (RENDER_TIMEOUT_SEC=0): max(600s, 30x duration) — loaded CPUs
+    need ~10x realtime for 1080x1920 software x264 + libass + loudnorm, and
+    viral batches run 2 encodes in parallel. Explicit RENDER_TIMEOUT_SEC
+    overrides (<=0 also means auto).
+    """
+    try:
+        override = float(getattr(settings, "RENDER_TIMEOUT_SEC", 0) or 0)
+    except (TypeError, ValueError):
+        override = 0.0
+    if override > 0:
+        return override
+    try:
+        duration_sec = max(1.0, float(duration_sec or 1.0))
+    except (TypeError, ValueError):
+        duration_sec = 1.0
+    return max(600.0, duration_sec * 30.0)
 
 
 def is_over_telegram_limit(path: Path) -> bool:
@@ -151,6 +173,9 @@ def render_video(
 
     srt_path: Path | None = None
     if words:
+        # Hindi captions + no Devanagari font = blank burn-in. Warn now
+        # (with the clip timestamps) instead of shipping a silent video.
+        warn_if_glyphs_missing(words)
         srt_path = TMP_DIR / f"sub-{os.getpid()}-{uuid.uuid4().hex[:8]}.srt"
         has_subs = write_srt(words, start_sec, end_sec, srt_path)
         if has_subs:
@@ -174,6 +199,7 @@ def render_video(
     try:
         # Accurate seek (-i BEFORE -ss): keyframe seek (-ss before -i) froze
         # the first ~0.5s and desynced burned subs. Slower but hook-accurate.
+        # Timeout scales with duration (slow CPUs need ~10x realtime).
         run([
             "ffmpeg", "-y",
             "-i", str(input_path),
@@ -197,7 +223,7 @@ def render_video(
             "-movflags", "+faststart",
             "-shortest",
             str(output_path),
-        ])
+        ], timeout=render_timeout_sec(duration_sec))
     finally:
         # Always clean up the per-render SRT so tmp/ doesn't grow forever.
         try:

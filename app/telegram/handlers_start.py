@@ -75,7 +75,10 @@ async def telegram_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_subtitles(query, context):
     keyboard = [
         [
+            InlineKeyboardButton("🔤 Hinglish", callback_data="subs:hinglish"),
             InlineKeyboardButton("🔤 English", callback_data="subs:english"),
+        ],
+        [
             InlineKeyboardButton("🗣️ Native", callback_data="subs:native"),
             InlineKeyboardButton("🚫 None", callback_data="subs:none"),
         ],
@@ -120,7 +123,10 @@ async def telegram_text_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Which subtitles?",
                 reply_markup=InlineKeyboardMarkup([
                     [
+                        InlineKeyboardButton("🔤 Hinglish", callback_data="subs:hinglish"),
                         InlineKeyboardButton("🔤 English", callback_data="subs:english"),
+                    ],
+                    [
                         InlineKeyboardButton("🗣️ Native", callback_data="subs:native"),
                         InlineKeyboardButton("🚫 None", callback_data="subs:none"),
                     ],

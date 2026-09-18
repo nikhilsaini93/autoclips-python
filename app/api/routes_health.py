@@ -8,6 +8,7 @@ from app.api.deps import limiter
 from app.config import settings
 from app.services.jobs import jobs
 from app.services.video.cleanup import cleanup_old_files
+from app.services.video.fonts import has_devanagari_font
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,15 @@ def health():
         disk_free_mb = round(free / (1024 * 1024), 1)
     except Exception:
         disk_free_mb = None
+    try:
+        devanagari_font = has_devanagari_font()
+    except Exception:
+        devanagari_font = False
     return {
         "status": "ok",
         "ffmpeg": ffmpeg_ok,
         "ffprobe": ffprobe_ok,
+        "devanagari_font": devanagari_font,
         "gemini_key_set": bool(settings.GEMINI_API_KEY),
         "disk_free_mb": disk_free_mb,
         "whisper_model": settings.WHISPER_MODEL_SIZE,

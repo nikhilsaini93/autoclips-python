@@ -36,6 +36,40 @@ def get_whisper_model():
     return _whisper_model
 
 
+def _cache_path_for(video_id: str, language, task: str) -> Path:
+    cache_key = f"{video_id}-{language or 'auto'}-{task}-m{settings.WHISPER_MODEL_SIZE}-v2"
+    return TMP_DIR / f"{cache_key}-words.json"
+
+
+def _read_cache_file(cache_path: Path) -> dict | None:
+    """Loads + v2-upgrades a transcript cache file. None if missing/corrupt."""
+    if not cache_path.exists():
+        return None
+    try:
+        result = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(result.get("words"), list):
+            return _ensure_v2_shape(result)
+        logger.warning("Transcript cache %s has bad shape, ignoring", cache_path)
+    except (OSError, ValueError) as e:
+        logger.warning("Ignoring corrupt transcript cache %s (%s)", cache_path, e)
+    try:
+        cache_path.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def peek_cached_transcript(video_id: str, task: str) -> dict | None:
+    """Returns the cached transcript for (video_id, auto, task) WITHOUT any
+    compute — None when nothing is cached yet. Used to skip redundant Whisper
+    passes (e.g. English audio needs no translate pass)."""
+    cached = _read_cache_file(_cache_path_for(video_id, None, task))
+    if cached is not None:
+        logger.info("Using cached transcript for %s-%s (%d words, language=%s)",
+                    video_id, task, len(cached.get("words") or []), cached.get("language"))
+    return cached
+
+
 def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> dict:
     """Runs Whisper and returns {"language", "words", "segments", "silences"}.
 
@@ -45,23 +79,13 @@ def _transcribe_words(video_id: str, video_path: Path, language, task: str) -> d
     and the structured Gemini prompt; v1 caches (words-only) are upgraded
     on the fly so old Drive caches keep working."""
     cache_key = f"{video_id}-{language or 'auto'}-{task}-m{settings.WHISPER_MODEL_SIZE}-v2"
-    cache_path = TMP_DIR / f"{cache_key}-words.json"
-    if cache_path.exists():
-        try:
-            result = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(result.get("words"), list):
-                upgraded = _ensure_v2_shape(result)
-                logger.info("Using cached transcript for %s (%d words, %d segments, %d silences, language=%s)",
-                            cache_key, len(upgraded["words"]), len(upgraded.get("segments", [])),
-                            len(upgraded.get("silences", [])), upgraded.get("language"))
-                return upgraded
-            logger.warning("Transcript cache %s has bad shape, re-transcribing", cache_path)
-        except (OSError, ValueError) as e:
-            logger.warning("Ignoring corrupt transcript cache %s (%s), re-transcribing", cache_path, e)
-        try:
-            cache_path.unlink()
-        except OSError:
-            pass
+    cache_path = _cache_path_for(video_id, language, task)
+    cached = _read_cache_file(cache_path)
+    if cached is not None:
+        logger.info("Using cached transcript for %s (%d words, %d segments, %d silences, language=%s)",
+                    cache_key, len(cached["words"]), len(cached.get("segments", [])),
+                    len(cached.get("silences", [])), cached.get("language"))
+        return cached
 
     logger.info("Transcribing video_id=%s (language=%s, task=%s, vad=%s) with Whisper...",
                 video_id, language or "auto", task, settings.WHISPER_VAD_FILTER)

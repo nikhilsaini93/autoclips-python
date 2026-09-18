@@ -124,7 +124,7 @@ flowchart LR
     V["POST clips-viral"] --> A
     V --> R["render each plus send to Telegram"]
     C["POST clip"] --> P
-    C --> S["resolve_subtitle_words - english, native, none"]
+    C --> S["resolve_subtitle_words - english, native, hinglish, none"]
     S --> R2["render one cut"]
     E["POST subtitles-english"] --> P
     E --> T["Whisper translate task"]
@@ -155,7 +155,7 @@ flowchart TB
 Notes / design choices (see README):
 
 - Download + transcript caches mean repeat calls on the same `video_id` reuse work.
-- `native` subtitles reuse the exact words used for detection → boundaries line up; `english` is a separate Whisper translate pass.
+- `native` subtitles reuse the exact words used for detection → boundaries line up; `english` is a separate Whisper translate pass; `hinglish` romanizes the native words to Latin script (same timings — Hindi reads as Hinglish, English passes through).
 - Gemini count is open-ended (1–10+); `max_clips` only caps. Bad timestamps / `end<=start` are skipped with a warning, never fail the batch.
 - Long videos are slow (download + transcribe + N×ffmpeg, synchronously in-request). Telegram jobs expose progress; next scale step would be Celery/RQ instead of in-memory `jobs`.
 

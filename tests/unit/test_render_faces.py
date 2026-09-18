@@ -10,7 +10,7 @@ def test_render_video_creates_parent_dir(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(render_mod, "get_video_dimensions", lambda _: (1920, 1080))
 
-    def fake_run(cmd):
+    def fake_run(cmd, **kwargs):
         assert out.parent.exists()
         out.write_bytes(b"video")
 
@@ -27,7 +27,7 @@ def test_detect_face_center_x_does_not_use_unsupported_vsync(tmp_path: Path, mon
 
     seen = []
 
-    def fake_run(cmd):
+    def fake_run(cmd, **kwargs):
         seen.append(cmd)
 
     monkeypatch.setattr(faces, "run", fake_run)

@@ -20,7 +20,7 @@ router = APIRouter()
 @limiter.limit("20/minute")
 def clip(request: Request, req: ClipRequest):
     """Cuts [start, end] out of the video, optionally with a 9:16 face-aware
-    crop and/or burned-in English subtitles."""
+    crop and/or burned-in subtitles (hinglish default)."""
     logger.info(
         "clip requested url=%s start=%s end=%s vertical_crop=%s subtitles=%s",
         req.url, req.start, req.end, req.vertical_crop, req.subtitles,

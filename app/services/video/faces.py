@@ -34,6 +34,24 @@ _yunet_lock = threading.Lock()
 _yolo_model = None
 _yolo_lock = threading.Lock()
 
+# Fallback warnings fire once per process (debug after) — without this, a
+# missing ultralytics install spams one WARNING per sampled frame (~60/clip).
+_fallback_warned: set[str] = set()
+
+# Detector that actually produced the last detect_faces_in_frame() result.
+# detect_face_center_x() collects these to log the truthful summary
+# (detector_kind() only reports the *configured* detector, which may have
+# fallen back on every frame).
+_last_detector_used = "unknown"
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    if key not in _fallback_warned:
+        _fallback_warned.add(key)
+        logger.warning(msg, *args)
+    else:
+        logger.debug(msg, *args)
+
 
 def ensure_face_model() -> None:
     ASSETS_FACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,17 +201,23 @@ def _yolo_faces(img):
 def detect_faces_in_frame(img):
     """All faces in an image as [(center_x_px, conf, width_px)]. Dispatches by
     FACE_MODEL with graceful fallback: yolo -> yunet -> res10."""
+    global _last_detector_used
     kind = detector_kind()
     if kind == "yolo":
         try:
-            return _yolo_faces(img)
+            out = _yolo_faces(img)
+            _last_detector_used = "yolo"
+            return out
         except Exception as e:
-            logger.warning("YOLO face failed (%s), falling back to YuNet.", e)
+            _warn_once("yolo->yunet", "YOLO face failed (%s), falling back to YuNet.", e)
     if kind in ("yolo", "yunet"):
         try:
-            return _yunet_faces(img)
+            out = _yunet_faces(img)
+            _last_detector_used = "yunet"
+            return out
         except Exception as e:
-            logger.warning("YuNet face failed (%s), falling back to Res10.", e)
+            _warn_once("yunet->res10", "YuNet face failed (%s), falling back to Res10.", e)
+    _last_detector_used = "res10"
     return _res10_faces(img)
 
 
@@ -339,12 +363,14 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
         grabbed = list(pool.map(_grab_frame, zip(sample_times, frame_paths)))
 
     detected_centers = []
+    used_detectors: set[str] = set()
     try:
         for frame_path in grabbed:
             if frame_path is None:
                 continue
             try:
                 center_x = detect_face_center_x_in_frame(frame_path, frame_width)
+                used_detectors.add(_last_detector_used)
                 if center_x is not None:
                     detected_centers.append(center_x)
             except Exception:
@@ -363,9 +389,10 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
         return frame_width / 2
 
     smoothed = smooth_centers(detected_centers)
+    actual = "+".join(sorted(used_detectors)) or detector_kind()
     logger.info(
         "Face detected in %d/%d sampled frames (%s) in %.2fs",
-        len(detected_centers), num_samples, detector_kind(), elapsed,
+        len(detected_centers), num_samples, actual, elapsed,
     )
     try:
         import numpy as np
