@@ -25,6 +25,12 @@ def _js_runtime_args() -> list[str]:
     "Unable to rename file: ... .part -> ..." errors. Passing
     --js-runtimes for what's actually installed fixes it without forcing
     every deploy to install deno.
+
+    NOTE: the path must exist — an old deploy passed a hardcoded
+    ``node:/tools/node/bin/node`` (Kaggle layout) which does not exist on
+    Colab (/usr/bin/node), so yt-dlp still reported "No supported JavaScript
+    runtime". We validate with shutil.which + existence check and skip
+    missing entries with a warning instead of passing a dead path.
     """
     candidates: list[tuple[str, str | None]] = [
         ("deno", shutil.which("deno")),
@@ -33,18 +39,69 @@ def _js_runtime_args() -> list[str]:
         ("quickjs", shutil.which("qjs") or shutil.which("quickjs")),
     ]
     args: list[str] = []
+    found: list[str] = []
     for name, path in candidates:
-        if path:
+        if path and Path(path).exists():
             # Explicit PATH survives nvm/venv layouts (e.g. node under
             # ~/.nvm) where the binary isn't on yt-dlp's minimal PATH.
             args += ["--js-runtimes", f"{name}:{path}"]
-    if not args:
+            found.append(f"{name}:{path}")
+        elif path:
+            logger.warning("JS runtime %s reported at %s but path missing, skipping", name, path)
+    if found:
+        logger.debug("JS runtimes for yt-dlp: %s", ", ".join(found))
+    else:
         logger.warning(
             "No JS runtime found (deno/node/bun/quickjs) — YouTube DASH "
             "downloads may fail with '.part rename' errors. Install one: "
             "'apt-get install -y nodejs' or https://github.com/yt-dlp/yt-dlp/wiki/EJS"
         )
     return args
+
+
+def _cookies_args() -> list[str]:
+    """Validate YOUTUBE_COOKIES_FILE and return yt-dlp --cookies args.
+
+    A stale/empty path is ignored with a warning (previous code passed it
+    blindly). A valid Netscape cookies.txt exported from a logged-in
+    browser is currently the only reliable fix for YouTube's
+    "Sign in to confirm you're not a bot" on datacenter IPs
+    (Colab/Kaggle/Cloud).
+    """
+    cookies = _cookies_file()
+    if not cookies:
+        return []
+    p = Path(cookies)
+    if not p.exists():
+        logger.warning("YOUTUBE_COOKIES_FILE=%s not found, ignoring", cookies)
+        return []
+    try:
+        if p.stat().st_size == 0:
+            logger.warning("YOUTUBE_COOKIES_FILE=%s is empty, ignoring", cookies)
+            return []
+        head = p.read_text(encoding="utf-8", errors="ignore")[:2000]
+        if "youtube.com" not in head.lower() and "netscape" not in head.lower() and "http cookie" not in head.lower():
+            logger.warning(
+                "YOUTUBE_COOKIES_FILE=%s doesn't look like a YouTube cookies.txt "
+                "(no youtube.com entries) — still passing it to yt-dlp, but re-export "
+                "from youtube.com if downloads fail",
+                cookies,
+            )
+    except OSError as e:
+        logger.warning("Could not read YOUTUBE_COOKIES_FILE=%s (%s), ignoring", cookies, e)
+        return []
+    return ["--cookies", str(p)]
+
+
+def _is_bot_check(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "sign in to confirm you" in t and "not a bot" in t
+    ) or (
+        "not a bot" in t and "sign in" in t
+    ) or (
+        "http error 429" in t and "youtube" in t
+    )
 
 
 def _cleanup_stale_temps(video_id: str) -> None:
@@ -115,12 +172,7 @@ def download_video(video_id: str) -> Path:
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     base_args: list[str] = []
-    cookies = _cookies_file()
-    if cookies:
-        if Path(cookies).exists():
-            base_args += ["--cookies", cookies]
-        else:
-            logger.warning("YOUTUBE_COOKIES_FILE=%s not found, ignoring", cookies)
+    base_args += _cookies_args()
     base_args += _js_runtime_args()
     base_args += [
         "--merge-output-format", "mp4",
@@ -136,6 +188,8 @@ def download_video(video_id: str) -> Path:
         "--fragment-retries", "5",
         "--file-access-retries", "3",
         "--concurrent-fragments", "4",
+        "--no-playlist",
+        "--socket-timeout", "30",
         # NOTE: -P temp: is ignored by yt-dlp when -o is absolute, so keep
         # -o relative and pin dirs explicitly: fragments assemble on local
         # disk even when storage/downloads/ is symlinked to Drive-FUSE
@@ -146,20 +200,42 @@ def download_video(video_id: str) -> Path:
     ]
     format_sort = ["--format-sort", "res:1080,fps,vcodec:avc1,acodec:aac"]
     # Primary: 1080p H.264-merge preference with VP9/AV1 fallback.
-    # Fallback: single progressive file — no DASH merge, works without a
+    # Fallback 2: single progressive file — no DASH merge, works without a
     # JS runtime / on bot-guarded IPs where f137+f140 deciphering fails.
+    # Fallbacks 3-4: mobile player clients (android/ios). These use a
+    # different YouTube InnerTube client that usually bypasses the
+    # "Sign in to confirm you're not a bot" web-client challenge on
+    # datacenter IPs (Colab/Kaggle) and needs no JS runtime — quality is
+    # capped (~720p) but better than a hard failure.
     attempts = [
-        ["-f", "bv*[height<=1080][vcodec^=avc1]+ba/bv*[height<=1080]+ba/bv*+ba/b"],
-        ["-f", "b[height<=1080]/b/best"],
+        {"label": "dash-merge",
+         "args": ["-f", "bv*[height<=1080][vcodec^=avc1]+ba/bv*[height<=1080]+ba/bv*+ba/b"]},
+        {"label": "progressive",
+         "args": ["-f", "b[height<=1080]/b/best"]},
+        {"label": "android-client",
+         "args": ["-f", "b/best",
+                  "--extractor-args", "youtube:player_client=android",
+                  "--format-sort", "res:720"]},
+        {"label": "ios-client",
+         "args": ["-f", "b/best",
+                  "--extractor-args", "youtube:player_client=ios",
+                  "--format-sort", "res:720"]},
     ]
     last_err: Exception | None = None
+    last_stderr: str = ""
+    saw_bot_check = False
+    saw_js_missing = False
     succeeded = False
-    for i, fmt in enumerate(attempts):
+    for i, attempt in enumerate(attempts):
+        fmt_args: list[str] = attempt["args"]
+        # format_sort already pins 1080p preference for web clients; mobile
+        # fallbacks carry their own res:720 sort — don't append a second one.
+        extra_sort = [] if "label" in attempt and attempt["label"] in ("android-client", "ios-client") else format_sort
         command = (
             ["yt-dlp"]
             + base_args
-            + fmt
-            + format_sort
+            + fmt_args
+            + extra_sort
             # Relative template + -P home: (see above) so temp assembly
             # stays on local disk. Final file: <DOWNLOAD_DIR>/<id>.mp4.
             + ["-o", f"{video_id}.%(ext)s", url]
@@ -167,13 +243,37 @@ def download_video(video_id: str) -> Path:
         try:
             # Long videos on slow links exceed the 600s default.
             run(command, timeout=1800)
+            if attempt["label"] in ("android-client", "ios-client"):
+                logger.warning(
+                    "Downloaded video_id=%s via %s fallback (reduced quality, "
+                    "YouTube bot-check bypass) — set YOUTUBE_COOKIES_FILE for full quality",
+                    video_id, attempt["label"],
+                )
             succeeded = True
         except Exception as e:
             last_err = e
+            # process.run() logs head+tail of stderr; also capture it here so
+            # the final error can distinguish "bot-check" (needs cookies)
+            # from "no JS runtime" (needs nodejs) instead of one generic blob.
+            import subprocess as _sp
+
+            err_text = ""
+            if isinstance(e, _sp.CalledProcessError):
+                try:
+                    err_text = ((e.stderr or b"").decode(errors="ignore") or "") + "\n" + ((e.stdout or b"").decode(errors="ignore") or "")
+                except Exception:
+                    err_text = str(e)
+            else:
+                err_text = str(e)
+            last_stderr += "\n" + err_text[-4000:]
+            if _is_bot_check(err_text):
+                saw_bot_check = True
+            if "no supported javascript runtime" in err_text.lower() or "js runtime" in err_text.lower():
+                saw_js_missing = True
             logger.warning(
                 "yt-dlp attempt %d/%d failed for video_id=%s (%s), %s",
-                i + 1, len(attempts), video_id, fmt[1],
-                "retrying with progressive fallback"
+                i + 1, len(attempts), video_id, attempt["label"],
+                f"retrying with {attempts[i + 1]['label']}"
                 if i + 1 < len(attempts) else "no more fallbacks",
             )
             _cleanup_stale_temps(video_id)
@@ -187,13 +287,41 @@ def download_video(video_id: str) -> Path:
             continue
         break
     if not succeeded:
+        tried = "+".join(a["label"] for a in attempts)
+        cookies_cfg = _cookies_file() or "(not set)"
+        if saw_bot_check:
+            raise RuntimeError(
+                f"YouTube blocked the download for video {video_id} "
+                f"('Sign in to confirm you're not a bot'). This is YouTube "
+                f"rate-limiting datacenter IPs (Colab/Kaggle/cloud) — not a bug "
+                f"in your link. Tried: {tried}. "
+                f"Fix: 1) In a desktop browser logged into YouTube, export "
+                f"cookies.txt (extension 'Get cookies.txt LOCALES'), "
+                f"2) Colab: upload it to /content/drive/MyDrive/autoclips-config/cookies.txt "
+                f"and set YOUTUBE_COOKIES_FILE to that path in .env, then restart; "
+                f"Kaggle: upload to /kaggle/working/cookies.txt and re-run cells 4-8; "
+                f"local/Docker: set YOUTUBE_COOKIES_FILE=cookies.txt. "
+                f"3) Re-upload the latest repo zip (old Colab code passed a dead "
+                f"--js-runtimes node:/tools/node/bin/node path). "
+                f"Or upload the MP4 directly to skip YouTube. "
+                f"(YOUTUBE_COOKIES_FILE={cookies_cfg}). Last error: {last_err}"
+            ) from last_err
+        if saw_js_missing:
+            raise RuntimeError(
+                f"yt-dlp download failed for video {video_id}: no working JS runtime "
+                f"found (tried {tried}). Install one: Colab/Kaggle re-run the system-deps "
+                f"cell ('apt-get install -y nodejs'), Docker already ships nodejs, "
+                f"Windows: install Node.js LTS and ensure 'node' is on PATH, then "
+                f"re-upload/restart with the latest code (old builds hardcoded "
+                f"node:/tools/node/bin/node which exists only on Kaggle). "
+                f"See https://github.com/yt-dlp/yt-dlp/wiki/EJS. Last error: {last_err}"
+            ) from last_err
         raise RuntimeError(
             f"yt-dlp download failed for video {video_id} "
-            f"(tried DASH merge + progressive fallback). "
-            f"Install a JS runtime (apt-get install -y nodejs, see "
-            f"https://github.com/yt-dlp/yt-dlp/wiki/EJS) and, on "
-            f"'Sign in to confirm you're not a bot', set "
-            f"YOUTUBE_COOKIES_FILE. Last error: {last_err}"
+            f"(tried {tried}). "
+            f"On 'Sign in to confirm you're not a bot', set "
+            f"YOUTUBE_COOKIES_FILE (YOUTUBE_COOKIES_FILE={cookies_cfg}); "
+            f"on JS-runtime warnings install nodejs. Last error: {last_err}"
         ) from last_err
     if not output_path.exists():
         # Defensive: --remux-video/--merge-output-format should always
@@ -258,12 +386,7 @@ def get_video_credit(video_id: str) -> str:
         command = ["yt-dlp", "--skip-download", "--no-warnings",
                    "--print", "%(uploader_id)s||%(channel)s||%(uploader)s||%(channel_url)s"]
         command += _js_runtime_args()
-        cookies = _cookies_file()
-        if cookies:
-            if Path(cookies).exists():
-                command += ["--cookies", cookies]
-            else:
-                logger.debug("YOUTUBE_COOKIES_FILE=%s not found, ignoring", cookies)
+        command += _cookies_args()
         command.append(url)
         out = subprocess.run(command, capture_output=True, text=True, timeout=25)
         raw = (out.stdout or "").strip().splitlines()

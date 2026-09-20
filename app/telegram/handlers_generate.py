@@ -26,6 +26,40 @@ from app.telegram.sending import send_clip_to_telegram
 logger = logging.getLogger(__name__)
 
 
+def _friendly_error(e: Exception) -> str:
+    """Translate yt-dlp/network failures into actionable Telegram text.
+
+    Raw RuntimeErrors leak local paths + 4-attempt command lines; users need
+    the fix, not the traceback. Bot-checks (datacenter IP blocks) are by far
+    the most common cause on Colab/Kaggle.
+    """
+    msg = str(e) or ""
+    low = msg.lower()
+    if "not a bot" in low or "sign in to confirm" in low:
+        return (
+            "❌ YouTube blocked this download (bot-check on the server's IP).\n\n"
+            "Fix (once): export cookies.txt from your logged-in desktop browser "
+            "(extension 'Get cookies.txt LOCALES' on youtube.com), then:\n"
+            "• Colab: upload it to /content/drive/MyDrive/autoclips-config/cookies.txt, "
+            "set YOUTUBE_COOKIES_FILE to that path in .env, restart the server cell.\n"
+            "• Kaggle: upload to /kaggle/working/cookies.txt and re-run cells 4–8.\n"
+            "• Local: set YOUTUBE_COOKIES_FILE=cookies.txt and restart.\n\n"
+            "Also re-upload the latest repo zip (old builds passed a dead "
+            "--js-runtimes node:/tools/node/bin/node path). "
+            "Or send the MP4 directly to skip YouTube."
+        )
+    if "no working js runtime" in low or "js runtime" in low:
+        return (
+            "❌ Video download needs a JavaScript runtime (yt-dlp requirement).\n\n"
+            "Fix: Colab/Kaggle re-run the system-deps cell "
+            "('apt-get install -y nodejs'), Docker already has it, "
+            "Windows install Node.js LTS — then restart with the latest code."
+        )
+    # Fallback: first line only, no local paths / command dumps.
+    first = msg.splitlines()[0][:500] if msg else "unknown error"
+    return f"❌ Generation failed.\n\nError: {first}"
+
+
 async def run_ai_generation(query, context):
     url = context.user_data.get("youtube_url")
     max_clips = context.user_data.get("max_clips")
@@ -96,7 +130,7 @@ async def run_ai_generation(query, context):
     except Exception as e:
         logger.exception("Telegram AI generation failed")
         update_job(job_id, status="failed", stage="failed", error=str(e))
-        fail_text = f"❌ Generation failed.\n\nError: {str(e)}\n🆔 Job: {job_id}"
+        fail_text = f"{_friendly_error(e)}\n🆔 Job: {job_id}"
         if progress_task is not None:
             progress_task.cancel()
         if chat_id is not None and message_id is not None:
@@ -207,7 +241,7 @@ async def run_timestamp_generation(query, context):
     except Exception as e:
         logger.exception("Telegram timestamp generation failed")
         update_job(job_id, status="failed", stage="failed", error=str(e))
-        fail_text = f"❌ Timestamp generation failed.\n\nError: {str(e)}\n🆔 Job: {job_id}"
+        fail_text = f"{_friendly_error(e)}\n🆔 Job: {job_id}"
         if progress_task is not None:
             progress_task.cancel()
         if chat_id is not None and message_id is not None:
