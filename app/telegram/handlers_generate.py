@@ -44,16 +44,26 @@ def _friendly_error(e: Exception) -> str:
             "set YOUTUBE_COOKIES_FILE to that path in .env, restart the server cell.\n"
             "• Kaggle: upload to /kaggle/working/cookies.txt and re-run cells 4–8.\n"
             "• Local: set YOUTUBE_COOKIES_FILE=cookies.txt and restart.\n\n"
-            "Also re-upload the latest repo zip (old builds passed a dead "
-            "--js-runtimes node:/tools/node/bin/node path). "
+            "Also re-upload the latest repo zip and make sure the JS-runtime "
+            "warning is gone (needs deno>=2 or node>=22). "
             "Or send the MP4 directly to skip YouTube."
         )
-    if "no working js runtime" in low or "js runtime" in low:
+    if ("no working js runtime" in low or "js runtime" in low or "sabr" in low
+            or "only images are available" in low
+            or "requested format is not available" in low
+            or "unable to download video data" in low
+            or ("http error 403" in low and "forbidden" in low)):
         return (
-            "❌ Video download needs a JavaScript runtime (yt-dlp requirement).\n\n"
-            "Fix: Colab/Kaggle re-run the system-deps cell "
-            "('apt-get install -y nodejs'), Docker already has it, "
-            "Windows install Node.js LTS — then restart with the latest code."
+            "❌ Video download failed: YouTube needs a working JavaScript runtime "
+            "(deno>=2 or node>=22) — without it you get SABR-only/403 errors.\n\n"
+            "Fix: re-upload the latest repo zip, then\n"
+            "• Colab/Kaggle: re-run the system-deps cell (now installs deno + "
+            "Node 22), check the log shows a JS runtime with no 'No supported "
+            "runtime' warning, then restart.\n"
+            "• Docker: rebuild the image (now ships deno).\n"
+            "• Windows: install Deno or Node.js 22 LTS.\n"
+            "Then `pip install -U yt-dlp`. If it still 403s, add cookies.txt "
+            "as YOUTUBE_COOKIES_FILE."
         )
     # Fallback: first line only, no local paths / command dumps.
     first = msg.splitlines()[0][:500] if msg else "unknown error"

@@ -15,22 +15,47 @@ def _cookies_file() -> str:
     return settings.YOUTUBE_COOKIES_FILE or ""
 
 
+def _runtime_version(name: str, path: str) -> tuple[int, ...] | None:
+    """Return version tuple for a JS runtime binary, or None if unrunnable.
+
+    yt-dlp silently reports "No supported JavaScript runtime" when the binary
+    exists but is too old (Colab/Kaggle/Debian apt nodejs is often v18;
+    yt-dlp needs node>=22 / deno>=2 in 2026 builds) or not executable
+    (broken /tools/node symlink). Checking here lets us log the real cause
+    instead of passing a dead --js-runtimes path.
+    """
+    try:
+        out = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=10
+        )
+        raw = ((out.stdout or "") + " " + (out.stderr or "")).strip()
+        import re
+
+        m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", raw)
+        if not m:
+            logger.warning("JS runtime %s at %s gave unreadable version: %r", name, path, raw[:100])
+            return None
+        return tuple(int(g) for g in m.groups() if g is not None)
+    except Exception as e:
+        logger.warning("JS runtime %s at %s not runnable (%s), skipping", name, path, e)
+        return None
+
+
 def _js_runtime_args() -> list[str]:
-    """Explicitly enable any installed JS runtime for yt-dlp.
+    """Explicitly enable any installed, *working* JS runtime for yt-dlp.
 
     yt-dlp enables *only* deno by default — a box with node but no deno
     (typical Colab/Kaggle/Docker) still reports "No supported JavaScript
-    runtime", which breaks YouTube DASH formats (f137/f140 signature
-    deciphering) and surfaces as misleading
-    "Unable to rename file: ... .part -> ..." errors. Passing
-    --js-runtimes for what's actually installed fixes it without forcing
-    every deploy to install deno.
+    runtime", which since late-2025 breaks YouTube entirely (SABR-only
+    streaming + HTTP 403 + "Only images are available"), not just DASH merges.
 
-    NOTE: the path must exist — an old deploy passed a hardcoded
-    ``node:/tools/node/bin/node`` (Kaggle layout) which does not exist on
-    Colab (/usr/bin/node), so yt-dlp still reported "No supported JavaScript
-    runtime". We validate with shutil.which + existence check and skip
-    missing entries with a warning instead of passing a dead path.
+    Two traps fixed here:
+    1. Dead path: old deploys passed hardcoded ``node:/tools/node/bin/node``
+       (Kaggle layout) missing on Colab — we validate existence.
+    2. Too-old node: apt/debian nodejs is v18-v20 but yt-dlp 2026 builds need
+       node>=22 (deno>=2). An old binary exists yet yt-dlp still warns "No
+       supported runtime" — we check ``--version`` and skip unsupported ones
+       with an actionable log instead of passing a useless flag.
     """
     candidates: list[tuple[str, str | None]] = [
         ("deno", shutil.which("deno")),
@@ -38,23 +63,49 @@ def _js_runtime_args() -> list[str]:
         ("bun", shutil.which("bun")),
         ("quickjs", shutil.which("qjs") or shutil.which("quickjs")),
     ]
+    # Minimums per https://github.com/yt-dlp/yt-dlp/wiki/EJS (2026 builds
+    # enforce node>=22 in practice; deno>=2.0).
+    minimums: dict[str, tuple[int, ...]] = {
+        "deno": (2,),
+        "node": (22,),
+        "bun": (1,),
+        "quickjs": (0,),
+    }
     args: list[str] = []
     found: list[str] = []
     for name, path in candidates:
-        if path and Path(path).exists():
-            # Explicit PATH survives nvm/venv layouts (e.g. node under
-            # ~/.nvm) where the binary isn't on yt-dlp's minimal PATH.
-            args += ["--js-runtimes", f"{name}:{path}"]
-            found.append(f"{name}:{path}")
-        elif path:
+        if not path:
+            continue
+        if not Path(path).exists():
             logger.warning("JS runtime %s reported at %s but path missing, skipping", name, path)
+            continue
+        ver = _runtime_version(name, path)
+        if ver is None:
+            continue
+        need = minimums.get(name, (0,))
+        if ver < need:
+            logger.warning(
+                "JS runtime %s at %s is v%s — too old for yt-dlp "
+                "(need %s+). Install deno (recommended, enabled by default) or "
+                "Node.js 22+: Colab/Kaggle re-run the system-deps cell, "
+                "Docker rebuilds with deno, Windows install Node.js LTS. "
+                "See https://github.com/yt-dlp/yt-dlp/wiki/EJS",
+                name, path, ".".join(map(str, ver)), ".".join(map(str, need)),
+            )
+            continue
+        # Explicit PATH survives nvm/venv layouts (e.g. node under
+        # ~/.nvm) where the binary isn't on yt-dlp's minimal PATH.
+        args += ["--js-runtimes", f"{name}:{path}"]
+        found.append(f"{name}:{path} (v{'.'.join(map(str, ver))})")
     if found:
         logger.debug("JS runtimes for yt-dlp: %s", ", ".join(found))
     else:
         logger.warning(
-            "No JS runtime found (deno/node/bun/quickjs) — YouTube DASH "
-            "downloads may fail with '.part rename' errors. Install one: "
-            "'apt-get install -y nodejs' or https://github.com/yt-dlp/yt-dlp/wiki/EJS"
+            "No working JS runtime found (need deno>=2 or node>=22) — YouTube "
+            "downloads will fail with SABR/403 errors. Install deno "
+            "(recommended): 'curl -fsSL https://deno.land/install.sh | sh' or "
+            "'apt-get install -y nodejs' only if it gives node>=22. "
+            "See https://github.com/yt-dlp/yt-dlp/wiki/EJS"
         )
     return args
 
@@ -101,6 +152,38 @@ def _is_bot_check(text: str) -> bool:
         "not a bot" in t and "sign in" in t
     ) or (
         "http error 429" in t and "youtube" in t
+    )
+
+
+def _is_sabr_block(text: str) -> bool:
+    """Detect YouTube's SABR-only / PO-token block (late-2025+ escalation).
+
+    Without a working JS runtime, YouTube returns no https formats (only SABR
+    URLs yt-dlp can't fetch): "Some * client https formats have been skipped
+    as they are missing a URL ... SABR-only", then "HTTP Error 403",
+    "Requested format is not available", "Only images are available".
+    This looks like an IP ban but is really a missing-runtime problem.
+    """
+    t = (text or "").lower()
+    return (
+        "sabr" in t
+        or "missing a url" in t
+        or "missing_pot" in t
+        or "only images are available" in t
+        or "requested format is not available" in t
+        or ("http error 403" in t and "youtube" in t)
+        or "unable to download video data" in t
+    )
+
+
+def _is_js_missing(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "no supported javascript runtime" in t
+        or "js runtime" in t
+        or "js challenge" in t
+        or "n challenge solving failed" in t
+        or "signature solving failed" in t
     )
 
 
@@ -175,6 +258,10 @@ def download_video(video_id: str) -> Path:
     base_args += _cookies_args()
     base_args += _js_runtime_args()
     base_args += [
+        # EJS challenge-solver scripts (yt-dlp 2025.11+): needed alongside the
+        # JS runtime to solve YouTube's n/signature challenges. Without this,
+        # even a good runtime can report "challenge solving failed".
+        "--remote-components", "ejs:github",
         "--merge-output-format", "mp4",
         # Single progressive fallbacks may arrive as webm — remux to mp4 so
         # the cache path below (<video_id>.mp4) always holds.
@@ -225,6 +312,7 @@ def download_video(video_id: str) -> Path:
     last_stderr: str = ""
     saw_bot_check = False
     saw_js_missing = False
+    saw_sabr = False
     succeeded = False
     for i, attempt in enumerate(attempts):
         fmt_args: list[str] = attempt["args"]
@@ -268,8 +356,10 @@ def download_video(video_id: str) -> Path:
             last_stderr += "\n" + err_text[-4000:]
             if _is_bot_check(err_text):
                 saw_bot_check = True
-            if "no supported javascript runtime" in err_text.lower() or "js runtime" in err_text.lower():
+            if _is_js_missing(err_text):
                 saw_js_missing = True
+            if _is_sabr_block(err_text):
+                saw_sabr = True
             logger.warning(
                 "yt-dlp attempt %d/%d failed for video_id=%s (%s), %s",
                 i + 1, len(attempts), video_id, attempt["label"],
@@ -289,6 +379,26 @@ def download_video(video_id: str) -> Path:
     if not succeeded:
         tried = "+".join(a["label"] for a in attempts)
         cookies_cfg = _cookies_file() or "(not set)"
+        if saw_js_missing or saw_sabr:
+            raise RuntimeError(
+                f"yt-dlp download failed for video {video_id} (tried {tried}): "
+                f"YouTube now requires a working JS runtime (deno>=2 or node>=22) "
+                f"plus yt-dlp's EJS solver — without it YouTube returns SABR-only "
+                f"streams that fail with HTTP 403 / 'Requested format is not "
+                f"available' / 'Only images are available'. Your log shows "
+                f"'No supported JavaScript runtime' with "
+                f"--js-runtimes node:/tools/node/bin/node: that binary exists but "
+                f"is too old (apt nodejs is v18-v20; yt-dlp 2026 builds need "
+                f"node>=22) or not executable. Fix: 1) Colab/Kaggle: re-run the "
+                f"system-deps cell (it now installs deno + Node 22) and restart "
+                f"with the latest repo zip, 2) Docker: rebuild (image now ships "
+                f"deno), 3) Windows: install Deno or Node.js 22 LTS, 4) then "
+                f"`pip install -U yt-dlp`. If it still 403s after the JS warning "
+                f"is gone, add cookies: export cookies.txt from a logged-in "
+                f"browser (extension 'Get cookies.txt LOCALES') and set "
+                f"YOUTUBE_COOKIES_FILE (now {cookies_cfg}). "
+                f"See https://github.com/yt-dlp/yt-dlp/wiki/EJS. Last error: {last_err}"
+            ) from last_err
         if saw_bot_check:
             raise RuntimeError(
                 f"YouTube blocked the download for video {video_id} "
@@ -306,22 +416,14 @@ def download_video(video_id: str) -> Path:
                 f"Or upload the MP4 directly to skip YouTube. "
                 f"(YOUTUBE_COOKIES_FILE={cookies_cfg}). Last error: {last_err}"
             ) from last_err
-        if saw_js_missing:
-            raise RuntimeError(
-                f"yt-dlp download failed for video {video_id}: no working JS runtime "
-                f"found (tried {tried}). Install one: Colab/Kaggle re-run the system-deps "
-                f"cell ('apt-get install -y nodejs'), Docker already ships nodejs, "
-                f"Windows: install Node.js LTS and ensure 'node' is on PATH, then "
-                f"re-upload/restart with the latest code (old builds hardcoded "
-                f"node:/tools/node/bin/node which exists only on Kaggle). "
-                f"See https://github.com/yt-dlp/yt-dlp/wiki/EJS. Last error: {last_err}"
-            ) from last_err
         raise RuntimeError(
             f"yt-dlp download failed for video {video_id} "
             f"(tried {tried}). "
             f"On 'Sign in to confirm you're not a bot', set "
             f"YOUTUBE_COOKIES_FILE (YOUTUBE_COOKIES_FILE={cookies_cfg}); "
-            f"on JS-runtime warnings install nodejs. Last error: {last_err}"
+            f"on SABR/403 or JS-runtime warnings install a working JS runtime "
+            f"(deno>=2 or node>=22, see https://github.com/yt-dlp/yt-dlp/wiki/EJS) "
+            f"and run `pip install -U yt-dlp`. Last error: {last_err}"
         ) from last_err
     if not output_path.exists():
         # Defensive: --remux-video/--merge-output-format should always
