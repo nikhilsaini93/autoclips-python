@@ -1,4 +1,5 @@
 import logging
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -8,35 +9,69 @@ from app.services.video.process import run
 
 logger = logging.getLogger(__name__)
 
+MAX_DOWNLOAD_ATTEMPTS = 2
+
 
 def _cookies_file() -> str:
     """Configured cookies file if it exists, else '' (never pass missing file)."""
-    raw = (settings.YOUTUBE_COOKIES_FILE or "").strip()
+    raw = (getattr(settings, "YOUTUBE_COOKIES_FILE", "") or "").strip()
     if not raw:
         return ""
     try:
         if Path(raw).expanduser().exists():
-            return raw
+            return str(Path(raw).expanduser())
         logger.warning("YOUTUBE_COOKIES_FILE=%s missing, downloading without cookies.", raw)
     except OSError:
         pass
     return ""
 
 
-def _base_command(video_id: str) -> tuple[list, str]:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    command = ["yt-dlp"]
+def _js_runtime_args() -> list:
+    """Point yt-dlp at Deno (needed to solve YouTube's JS challenges).
+
+    Looks on PATH first, then the default installer location, so it works even
+    when uvicorn was started from a shell that never exported ~/.deno/bin.
+    Returns [] if Deno isn't installed (yt-dlp then falls back to its defaults).
+    """
+    deno = shutil.which("deno")
+    if not deno:
+        candidate = Path.home() / ".deno" / "bin" / "deno"
+        if candidate.exists():
+            deno = str(candidate)
+    if not deno:
+        logger.warning("Deno not found - YouTube downloads may fail or miss formats.")
+        return []
+    return ["--js-runtimes", f"deno:{deno}"]
+
+
+def _ytdlp_base() -> list:
+    """yt-dlp executable + JS runtime + cookies (when available)."""
+    command = ["yt-dlp"] + _js_runtime_args()
     cookies = _cookies_file()
     if cookies:
         command += ["--cookies", cookies]
-    return command, url
+    return command
+
+
+def _base_command(video_id: str) -> tuple[list, str]:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    return _ytdlp_base(), url
+
+
+def _error_text(e: Exception) -> str:
+    """Best-effort readable message from a failed yt-dlp subprocess."""
+    stderr = getattr(e, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    stderr = (stderr or "").strip()
+    return stderr[-800:] if stderr else str(e)
 
 
 def download_video(video_id: str) -> Path:
     """Downloads (once) and caches the source video on disk, keyed by video_id.
 
-    Intermittent Colab fix: retries with android -> web player clients since
-    YouTube flags shared datacenter IPs randomly. Raises last error if all fail.
+    Retries once because YouTube flags shared datacenter IPs (e.g. Colab)
+    intermittently. Raises the last error if all attempts fail.
     """
     output_path = DOWNLOAD_DIR / f"{video_id}.mp4"
     if output_path.exists():
@@ -46,44 +81,43 @@ def download_video(video_id: str) -> Path:
     logger.info("Downloading video_id=%s via yt-dlp...", video_id)
     t0 = time.perf_counter()
     base, url = _base_command(video_id)
-    # android often bypasses bot check without cookies; web handles most formats.
-    attempts = [
-        ["--extractor-args", "youtube:player_client=android"],
-        [],
+
+    command = base + [
+        # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
+        # which matters since clips get re-decoded multiple times
+        # (face-detection frame grabs + the final cut/subtitle burn)
+        "-f",
+        "bv*[vcodec^=avc1]+ba/bv*+ba/b",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        str(output_path),
+        url,
     ]
+
     last_err: Exception | None = None
-    for i, extra in enumerate(attempts):
-        command = (
-            base
-            + extra
-            + [
-                # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
-                # which matters since clips get re-decoded multiple times
-                # (face-detection frame grabs + the final cut/subtitle burn)
-                "-f",
-                "bv*[vcodec^=avc1]+ba/bv*+ba/b",
-                "--merge-output-format",
-                "mp4",
-                "-o",
-                str(output_path),
-                url,
-            ]
-        )
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
             run(command)
+            last_err = None
             break
         except Exception as e:
             last_err = e
-            logger.warning("Download attempt %d/2 failed for %s (%s)", i + 1, video_id, e)
+            logger.warning(
+                "Download attempt %d/%d failed for %s: %s",
+                attempt, MAX_DOWNLOAD_ATTEMPTS, video_id, _error_text(e),
+            )
             try:
                 if output_path.exists():
                     output_path.unlink()
             except OSError:
                 pass
-            if i < len(attempts) - 1:
+            if attempt < MAX_DOWNLOAD_ATTEMPTS:
                 time.sleep(3)
-    else:
-        raise last_err or RuntimeError(f"yt-dlp failed for {video_id}")
+
+    if last_err is not None:
+        raise last_err
+
     size_mb = output_path.stat().st_size / (1024 * 1024)
     logger.info(
         "Download finished for video_id=%s in %.1fs (%.1f MB)",
@@ -105,12 +139,13 @@ def get_video_credit(video_id: str) -> str:
             if cached:
                 return cached
         url = f"https://www.youtube.com/watch?v={video_id}"
-        command = ["yt-dlp", "--skip-download", "--no-warnings",
-                   "--print", "%(uploader_id)s||%(channel)s||%(uploader)s||%(channel_url)s"]
-        cookies = _cookies_file()
-        if cookies:
-            command += ["--cookies", cookies]
-        command.append(url)
+        command = _ytdlp_base() + [
+            "--skip-download",
+            "--no-warnings",
+            "--print",
+            "%(uploader_id)s||%(channel)s||%(uploader)s||%(channel_url)s",
+            url,
+        ]
         out = subprocess.run(command, capture_output=True, text=True, timeout=25)
         raw = (out.stdout or "").strip().splitlines()
         line = raw[-1].strip() if raw else ""
