@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     FACE_SMOOTH_WINDOW: int = 5
     # Max horizontal pan speed (px/sec at source resolution) to avoid jitter.
     FACE_MAX_PAN_PX_PER_SEC: float = 200.0
+    # Optional explicit path to yolov8n-face.pt (e.g. Drive-persisted file on
+    # Colab). When empty, assets/face_detector/yolov8n-face.pt is used.
+    FACE_YOLO_WEIGHTS: str = ""
+    # Direct HuggingFace URLs bypass api.github.com (403 rate-limited on
+    # Colab shared IPs when ultralytics tries auto-download).
+    YOLO_FACE_URL: str = (
+        "https://huggingface.co/Autsadin/yolov8-face/resolve/main/yolov8n-face.pt"
+    )
+    YOLO_FACE_URL_FALLBACK: str = (
+        "https://huggingface.co/deepghs/yolo-face/resolve/main/yolov8n-face/model.pt"
+    )
     SMOOTH_CROP: bool = True
     # Snap AI cut boundaries to sentence ends / silences instead of mid-word.
     SNAP_TO_SILENCE: bool = True
@@ -95,6 +106,7 @@ ASSETS_FACE_DIR = ROOT / "assets" / "face_detector"
 PROTOTXT_PATH = ASSETS_FACE_DIR / "deploy.prototxt"
 CAFFEMODEL_PATH = ASSETS_FACE_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 YUNET_PATH = ASSETS_FACE_DIR / "face_detection_yunet_2023mar.onnx"
+YOLO_PATH = ASSETS_FACE_DIR / "yolov8n-face.pt"
 
 for _d in (DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR, LOGS_DIR, ASSETS_FACE_DIR):
     _d.mkdir(parents=True, exist_ok=True)

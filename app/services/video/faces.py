@@ -8,7 +8,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from app.config import ASSETS_FACE_DIR, CAFFEMODEL_PATH, PROTOTXT_PATH, YUNET_PATH, settings
+from app.config import (
+    ASSETS_FACE_DIR,
+    CAFFEMODEL_PATH,
+    PROTOTXT_PATH,
+    YOLO_PATH,
+    YUNET_PATH,
+    settings,
+)
 from app.services.video.process import run
 
 logger = logging.getLogger(__name__)
@@ -33,6 +40,14 @@ _yunet_net = None
 _yunet_lock = threading.Lock()
 _yolo_model = None
 _yolo_lock = threading.Lock()
+# Cached YOLO failure: try download/load once per process, then stay on YuNet
+# instead of retrying (and spamming logs) for every sampled frame.
+_yolo_unavailable = False
+_yolo_warned = False
+_yunet_warned = False
+# Last detector actually used (yolo|yunet|res10); updated per frame so the
+# clip-level summary log reports what ran, not just what was requested.
+_last_actual_detector: str | None = None
 
 
 def ensure_face_model() -> None:
@@ -52,6 +67,67 @@ def ensure_yunet_model() -> Path:
         logger.info("Downloading YuNet face weights (~400KB, one-time)...")
         urllib.request.urlretrieve(YUNET_URL, YUNET_PATH)
     return YUNET_PATH
+
+
+def _yolo_weights_path() -> Path:
+    """Resolve yolov8n-face.pt location.
+
+    Priority: FACE_YOLO_WEIGHTS env (e.g. Drive-persisted file on Colab) then
+    assets/face_detector/yolov8n-face.pt.
+    """
+    custom = (getattr(settings, "FACE_YOLO_WEIGHTS", "") or "").strip()
+    if custom:
+        return Path(custom).expanduser()
+    return YOLO_PATH
+
+
+def ensure_yolo_model() -> Path:
+    """Ensure yolov8n-face.pt exists locally, downloading once if needed.
+
+    Uses direct HuggingFace URLs instead of ultralytics auto-download so we
+    bypass api.github.com (403 rate-limited on Colab shared IPs). Raises
+    RuntimeError if all URLs fail so callers fall back to YuNet.
+    """
+    path = _yolo_weights_path()
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    urls = [
+        (getattr(settings, "YOLO_FACE_URL", "") or "").strip(),
+        (getattr(settings, "YOLO_FACE_URL_FALLBACK", "") or "").strip(),
+    ]
+    urls = [u for u in urls if u]
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            logger.info("Downloading YOLO face weights (~6MB, one-time) from %s...", url)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            urllib.request.urlretrieve(url, tmp)
+            if tmp.stat().st_size == 0:
+                raise RuntimeError(f"empty download from {url}")
+            tmp.replace(path)
+            return path
+        except Exception as e:
+            last_err = e
+            logger.warning("YOLO weights download failed from %s (%s)", url, e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    raise RuntimeError(f"Could not download yolov8n-face.pt ({last_err})")
+
+
+def _reset_face_state() -> None:
+    """Test helper: clear cached models and fallback flags."""
+    global _face_net, _yunet_net, _yolo_model
+    global _yolo_unavailable, _yolo_warned, _yunet_warned, _last_actual_detector
+    _face_net = None
+    _yunet_net = None
+    _yolo_model = None
+    _yolo_unavailable = False
+    _yolo_warned = False
+    _yunet_warned = False
+    _last_actual_detector = None
 
 
 def detector_kind() -> str:
@@ -90,23 +166,34 @@ def get_yunet_net():
 def get_yolo_model():
     """Ultralytics YOLO face model on CUDA when available, else CPU.
 
-    Raises ImportError/RuntimeError so callers can fall back to YuNet/Res10
-    instead of crashing when ultralytics isn't installed (CPU boxes)."""
-    global _yolo_model
+    Downloads weights once via ensure_yolo_model() (direct HF URL). Any
+    failure marks YOLO unavailable for the rest of the process so callers
+    fall back to YuNet/Res10 instead of retrying per frame.
+    Raises ImportError/RuntimeError on failure."""
+    global _yolo_model, _yolo_unavailable
+    if _yolo_unavailable:
+        raise RuntimeError("YOLO face model unavailable (cached failure)")
     if _yolo_model is None:
         with _yolo_lock:
             if _yolo_model is None:
-                from ultralytics import YOLO
-
-                import torch
-
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                _yolo_model = YOLO("yolov8n-face.pt")
+                if _yolo_unavailable:
+                    raise RuntimeError("YOLO face model unavailable (cached failure)")
                 try:
-                    _yolo_model.to(device)
+                    from ultralytics import YOLO
+
+                    import torch
+
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    weights = str(ensure_yolo_model())
+                    _yolo_model = YOLO(weights)
+                    try:
+                        _yolo_model.to(device)
+                    except Exception:
+                        pass
+                    logger.info("YOLO face model loaded (%s, device=%s).", weights, device)
                 except Exception:
-                    pass
-                logger.info("YOLO face model loaded (yolov8n-face.pt, device=%s).", device)
+                    _yolo_unavailable = True
+                    raise
     return _yolo_model
 
 
@@ -180,40 +267,74 @@ def _yolo_faces(img):
     return out
 
 
+def detect_faces_in_frame_with_kind(img) -> tuple[list, str]:
+    """Same as detect_faces_in_frame but also returns actual detector used.
+
+    YOLO is tried at most once per process: after the first failure
+    _yolo_unavailable is set and later frames go straight to YuNet with only
+    a debug log (first failure logs one warning).
+    """
+    global _yolo_warned, _yunet_warned, _last_actual_detector, _yolo_unavailable
+    kind = detector_kind()
+    if kind == "yolo" and not _yolo_unavailable:
+        try:
+            faces = _yolo_faces(img)
+            _last_actual_detector = "yolo"
+            return faces, "yolo"
+        except Exception as e:
+            _yolo_unavailable = True
+            if not _yolo_warned:
+                _yolo_warned = True
+                logger.warning("YOLO face failed (%s), falling back to YuNet.", e)
+            else:
+                logger.debug("YOLO face failed (%s), falling back to YuNet.", e)
+    elif kind == "yolo" and _yolo_unavailable:
+        logger.debug("Skipping YOLO (cached failure), using YuNet.")
+    if kind in ("yolo", "yunet"):
+        try:
+            faces = _yunet_faces(img)
+            _last_actual_detector = "yunet"
+            return faces, "yunet"
+        except Exception as e:
+            if not _yunet_warned:
+                _yunet_warned = True
+                logger.warning("YuNet face failed (%s), falling back to Res10.", e)
+            else:
+                logger.debug("YuNet face failed (%s), falling back to Res10.", e)
+    faces = _res10_faces(img)
+    _last_actual_detector = "res10"
+    return faces, "res10"
+
+
 def detect_faces_in_frame(img):
     """All faces in an image as [(center_x_px, conf, width_px)]. Dispatches by
     FACE_MODEL with graceful fallback: yolo -> yunet -> res10."""
-    kind = detector_kind()
-    if kind == "yolo":
-        try:
-            return _yolo_faces(img)
-        except Exception as e:
-            logger.warning("YOLO face failed (%s), falling back to YuNet.", e)
-    if kind in ("yolo", "yunet"):
-        try:
-            return _yunet_faces(img)
-        except Exception as e:
-            logger.warning("YuNet face failed (%s), falling back to Res10.", e)
-    return _res10_faces(img)
+    faces, _ = detect_faces_in_frame_with_kind(img)
+    return faces
 
 
-def detect_face_center_x_in_frame(frame_path: Path, frame_width: int):
+def detect_face_center_x_in_frame_with_kind(frame_path: Path, frame_width: int) -> tuple[float | None, str]:
     import cv2
 
     img = cv2.imread(str(frame_path))
     if img is None:
-        return None
+        return None, _last_actual_detector or detector_kind()
     img_height, img_width = img.shape[:2]
     try:
-        faces = detect_faces_in_frame(img)
+        faces, actual = detect_faces_in_frame_with_kind(img)
     except Exception:
         logger.exception("Face detection failed for %s", frame_path)
-        return None
+        return None, _last_actual_detector or detector_kind()
     if not faces:
-        return None
+        return None, actual
     # Prefer large confident faces (talking head) over tiny background faces.
     best = max(faces, key=lambda f: (f[1], f[2]))
-    return (best[0] / img_width) * frame_width
+    return (best[0] / img_width) * frame_width, actual
+
+
+def detect_face_center_x_in_frame(frame_path: Path, frame_width: int):
+    center, _ = detect_face_center_x_in_frame_with_kind(frame_path, frame_width)
+    return center
 
 
 def _sample_times(start_sec: float, end_sec: float) -> list:
@@ -272,9 +393,25 @@ def smooth_centers(centers: list, window: int | None = None) -> list:
     return out
 
 
+def _effective_requested_kind() -> str:
+    """Requested detector corrected for cached YOLO failure."""
+    kind = detector_kind()
+    if kind == "yolo" and _yolo_unavailable:
+        return "yunet"
+    return kind
+
+
+def _summary_detector(actuals: list[str]) -> str:
+    """Most common actual detector, or effective requested kind if none."""
+    if actuals:
+        return max(set(actuals), key=actuals.count)
+    return _effective_requested_kind()
+
+
 def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, frame_width: int) -> float:
+    global _last_actual_detector
     logger.info("Running face detection (%s) over [%.1f, %.1f] for vertical crop...",
-                detector_kind(), start_sec, end_sec)
+                _effective_requested_kind(), start_sec, end_sec)
     t0 = time.perf_counter()
     sample_times = _sample_times(start_sec, end_sec)
     num_samples = len(sample_times)
@@ -290,13 +427,11 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
     def _grab_frame(args) -> Path | None:
         t, frame_path = args
         try:
-            # Fast seek (-ss BEFORE -i): faster and avoids exit 255 errors 
+            # Fast seek (-ss BEFORE -i): faster and avoids exit 255 errors
             # if the timestamp is slightly past the end of the video.
-            import subprocess
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path), "-frames:v", "1", str(frame_path)],
-                check=True,
-                capture_output=True
+            # Use shared run() helper (mockable in tests, logs stderr).
+            run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(input_path), "-frames:v", "1", str(frame_path)]
             )
             return frame_path
         except Exception as e:
@@ -307,12 +442,18 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
         grabbed = list(pool.map(_grab_frame, zip(sample_times, frame_paths)))
 
     detected_centers = []
+    actuals: list[str] = []
     try:
         for frame_path in grabbed:
             if frame_path is None:
                 continue
             try:
+                # Reset per-frame so we only record the detector used for
+                # this frame (mocked wrappers leave it None -> ignored).
+                _last_actual_detector = None
                 center_x = detect_face_center_x_in_frame(frame_path, frame_width)
+                if _last_actual_detector is not None:
+                    actuals.append(_last_actual_detector)
                 if center_x is not None:
                     detected_centers.append(center_x)
             except Exception:
@@ -326,14 +467,16 @@ def detect_face_center_x(input_path: Path, start_sec: float, end_sec: float, fra
                 pass
 
     elapsed = time.perf_counter() - t0
+    actual_kind = _summary_detector(actuals)
     if not detected_centers:
-        logger.info("No face detected in %d sampled frames (%.2fs) - falling back to center crop", num_samples, elapsed)
+        logger.info("No face detected in %d sampled frames (%s, %.2fs) - falling back to center crop",
+                    num_samples, actual_kind, elapsed)
         return frame_width / 2
 
     smoothed = smooth_centers(detected_centers)
     logger.info(
         "Face detected in %d/%d sampled frames (%s) in %.2fs",
-        len(detected_centers), num_samples, detector_kind(), elapsed,
+        len(detected_centers), num_samples, actual_kind, elapsed,
     )
     try:
         import numpy as np

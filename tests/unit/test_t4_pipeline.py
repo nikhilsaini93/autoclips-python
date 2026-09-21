@@ -97,6 +97,7 @@ def test_smooth_centers_moving_average():
 def test_detector_kind_falls_back(monkeypatch):
     import app.services.video.faces as faces
 
+    faces._reset_face_state()
     monkeypatch.setattr(faces.settings, "FACE_MODEL", "bogus")
     assert faces.detector_kind() == "res10"
 
@@ -115,10 +116,98 @@ def test_sample_times_dense_and_clamped(monkeypatch):
 def test_detect_face_center_x_falls_back_to_center(tmp_path, monkeypatch):
     import app.services.video.faces as faces
 
+    faces._reset_face_state()
     monkeypatch.setattr(faces.settings, "FACE_SAMPLE_FPS", 1.0)
     monkeypatch.setattr(faces, "run", lambda cmd: None)
     monkeypatch.setattr(faces, "detect_face_center_x_in_frame", lambda fp, fw: None)
     assert faces.detect_face_center_x(tmp_path / "v.mp4", 0.0, 4.0, 200) == 100.0
+
+
+def test_yolo_failure_warns_once_then_cached(monkeypatch, caplog):
+    import logging
+
+    import app.services.video.faces as faces
+
+    faces._reset_face_state()
+    monkeypatch.setattr(faces.settings, "FACE_MODEL", "yolo")
+    monkeypatch.setattr(faces, "_yolo_faces", lambda img: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(faces, "_yunet_faces", lambda img: [(10.0, 0.9, 20.0)])
+    monkeypatch.setattr(faces, "_res10_faces", lambda img: (_ for _ in ()).throw(AssertionError("no res10")))
+
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="app.services.video.faces"):
+        f1, k1 = faces.detect_faces_in_frame_with_kind(object())
+        f2, k2 = faces.detect_faces_in_frame_with_kind(object())
+    assert k1 == "yunet" and k2 == "yunet"
+    assert f1 == [(10.0, 0.9, 20.0)]
+    yolo_warns = [r for r in caplog.records if "YOLO face failed" in r.getMessage()]
+    assert len(yolo_warns) == 1
+    assert faces._yolo_unavailable is True
+
+
+def test_yunet_direct_mode_never_tries_yolo(monkeypatch):
+    import app.services.video.faces as faces
+
+    faces._reset_face_state()
+    monkeypatch.setattr(faces.settings, "FACE_MODEL", "yunet")
+    called = {}
+
+    def _boom(_img):
+        called["yolo"] = True
+        raise AssertionError("yolo should not run")
+
+    monkeypatch.setattr(faces, "_yolo_faces", _boom)
+    monkeypatch.setattr(faces, "_yunet_faces", lambda img: [(5.0, 0.8, 10.0)])
+    faces_out, kind = faces.detect_faces_in_frame_with_kind(object())
+    assert kind == "yunet"
+    assert "yolo" not in called
+
+
+def test_summary_detector_reports_actual(monkeypatch):
+    import app.services.video.faces as faces
+
+    faces._reset_face_state()
+    assert faces._summary_detector(["yunet", "yunet", "yolo"]) == "yunet"
+    assert faces._summary_detector([]) in ("yolo", "yunet", "res10")
+    monkeypatch.setattr(faces.settings, "FACE_MODEL", "yolo")
+    faces._yolo_unavailable = True
+    assert faces._effective_requested_kind() == "yunet"
+
+
+def test_ensure_yolo_model_uses_existing_file(tmp_path, monkeypatch):
+    import app.services.video.faces as faces
+
+    faces._reset_face_state()
+    w = tmp_path / "yolov8n-face.pt"
+    w.write_bytes(b"x" * 16)
+    monkeypatch.setattr(faces.settings, "FACE_YOLO_WEIGHTS", str(w))
+    assert faces.ensure_yolo_model() == w
+
+
+def test_ensure_yolo_model_downloads_primary_then_fallback(tmp_path, monkeypatch):
+    import urllib.request
+    from pathlib import Path
+
+    import app.services.video.faces as faces
+
+    faces._reset_face_state()
+    w = tmp_path / "sub" / "yolov8n-face.pt"
+    monkeypatch.setattr(faces.settings, "FACE_YOLO_WEIGHTS", str(w))
+    monkeypatch.setattr(faces.settings, "YOLO_FACE_URL", "http://primary/y.pt")
+    monkeypatch.setattr(faces.settings, "YOLO_FACE_URL_FALLBACK", "http://fallback/y.pt")
+    calls = []
+
+    def fake_retrieve(url, dst):
+        calls.append(url)
+        if "primary" in url:
+            raise OSError("403 rate limit")
+        Path(dst).write_bytes(b"y" * 32)
+        return (str(dst), None)
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_retrieve)
+    assert faces.ensure_yolo_model() == w
+    assert calls == ["http://primary/y.pt", "http://fallback/y.pt"]
 
 
 def test_srt_timestamp_no_overflow():
