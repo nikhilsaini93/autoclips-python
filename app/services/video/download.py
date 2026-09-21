@@ -1,0 +1,270 @@
+import logging
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+from app.config import DOWNLOAD_DIR, TMP_DIR, settings
+
+logger = logging.getLogger(__name__)
+
+# Tried in order. Chunked + IPv4 fixes the "N bytes read, M more expected" cut-offs
+# YouTube applies to datacenter IPs (e.g. Colab); the second attempt uses other
+# player clients (HLS) as a fallback.
+DOWNLOAD_ATTEMPTS = [
+    ["--http-chunk-size", "10M", "--force-ipv4"],
+    ["--http-chunk-size", "10M", "--force-ipv4",
+     "--extractor-args", "youtube:player_client=tv,web_safari"],
+]
+
+_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+PROGRESS_REFRESH = 0.3  # seconds between redraws of the progress line
+
+
+def _cookies_file() -> str:
+    """Configured cookies file if it exists, else '' (never pass missing file)."""
+    raw = (getattr(settings, "YOUTUBE_COOKIES_FILE", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        if Path(raw).expanduser().exists():
+            return str(Path(raw).expanduser())
+        logger.warning("YOUTUBE_COOKIES_FILE=%s missing, downloading without cookies.", raw)
+    except OSError:
+        pass
+    return ""
+
+
+def _js_runtime_args() -> list:
+    """Point yt-dlp at Deno (needed to solve YouTube's JS challenges).
+
+    Looks on PATH first, then the default installer location, so it works even
+    when uvicorn was started from a shell that never exported ~/.deno/bin.
+    Returns [] if Deno isn't installed (yt-dlp then falls back to its defaults).
+    """
+    deno = shutil.which("deno")
+    if not deno:
+        candidate = Path.home() / ".deno" / "bin" / "deno"
+        if candidate.exists():
+            deno = str(candidate)
+    if not deno:
+        logger.warning("Deno not found - YouTube downloads may fail or miss formats.")
+        return []
+    return ["--js-runtimes", f"deno:{deno}"]
+
+
+def _ytdlp_base() -> list:
+    """yt-dlp executable + JS runtime + cookies (when available)."""
+    command = ["yt-dlp"] + _js_runtime_args()
+    cookies = _cookies_file()
+    if cookies:
+        command += ["--cookies", cookies]
+    return command
+
+
+def _base_command(video_id: str) -> tuple[list, str]:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    return _ytdlp_base(), url
+
+
+def _error_text(e: Exception) -> str:
+    """Best-effort readable message from a failed yt-dlp subprocess."""
+    stderr = getattr(e, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    stderr = (stderr or "").strip()
+    return stderr[-800:] if stderr else str(e)
+
+
+def _run_with_progress(command: list, video_id: str) -> None:
+    """Run yt-dlp and show live progress on ONE terminal line (overwritten in place).
+
+    Raises CalledProcessError (with the output tail in .stderr) on failure,
+    so _error_text() and the retry loop keep working.
+    """
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    tail = deque(maxlen=30)  # last lines, kept for error reporting
+    last_draw = 0.0
+    progress_active = False  # True while a progress line is on screen
+    width = 0
+
+    def end_progress_line() -> None:
+        nonlocal progress_active
+        if progress_active:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            progress_active = False
+
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        tail.append(line)
+
+        if _PROGRESS_RE.search(line):
+            now = time.monotonic()
+            done = "100%" in line
+            if done or now - last_draw >= PROGRESS_REFRESH:
+                text = f"[{video_id}] {line}"
+                width = max(width, len(text))
+                sys.stdout.write("\r" + text.ljust(width))  # pad to erase leftovers
+                sys.stdout.flush()
+                progress_active = True
+                last_draw = now
+            if done:
+                end_progress_line()  # finish this line; next stream starts fresh
+        else:
+            end_progress_line()
+            if line.startswith(("[download]", "[Merger]", "[info]")):
+                logger.info("[%s] %s", video_id, line)
+            else:
+                logger.debug("[%s] %s", video_id, line)
+
+    end_progress_line()
+    returncode = proc.wait()
+    if returncode != 0:
+        out = "\n".join(tail)
+        raise subprocess.CalledProcessError(returncode, command, output=out, stderr=out)
+
+
+def download_video(video_id: str) -> Path:
+    """Downloads (once) and caches the source video on disk, keyed by video_id.
+
+    Retries with different yt-dlp options because YouTube flags shared datacenter
+    IPs (e.g. Colab) intermittently. Raises the last error if all attempts fail.
+    """
+    output_path = DOWNLOAD_DIR / f"{video_id}.mp4"
+    if output_path.exists():
+        logger.info("Using cached download for video_id=%s (%s)", video_id, output_path)
+        return output_path
+
+    logger.info("Downloading video_id=%s via yt-dlp...", video_id)
+    t0 = time.perf_counter()
+    base, url = _base_command(video_id)
+
+    format_args = [
+        "--newline",  # one progress update per line (needed to read it from a pipe)
+        # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
+        # which matters since clips get re-decoded multiple times
+        # (face-detection frame grabs + the final cut/subtitle burn)
+        "-f", "bv*[vcodec^=avc1]+ba/bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", str(output_path),
+        url,
+    ]
+
+    last_err: Exception | None = None
+    for attempt, extra in enumerate(DOWNLOAD_ATTEMPTS, start=1):
+        command = base + extra + format_args
+        try:
+            _run_with_progress(command, video_id)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "Download attempt %d/%d failed for %s: %s",
+                attempt, len(DOWNLOAD_ATTEMPTS), video_id, _error_text(e),
+            )
+            # remove partial output and leftovers like *.f137.mp4 / *.part
+            for leftover in DOWNLOAD_DIR.glob(f"{video_id}*"):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            if attempt < len(DOWNLOAD_ATTEMPTS):
+                time.sleep(3)
+
+    if last_err is not None:
+        raise last_err
+
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        "Download finished for video_id=%s in %.1fs (%.1f MB)",
+        video_id, time.perf_counter() - t0, size_mb,
+    )
+    return output_path
+
+
+def get_video_credit(video_id: str) -> str:
+    """Returns '@handle' credit for the source video (e.g. '@ranveerallahbadia').
+
+    Uses yt-dlp metadata only (no download), cached under storage/tmp/ so one video
+    costs one lookup. Returns '' on any failure — callers must tolerate that.
+    """
+    try:
+        cache_path = TMP_DIR / f"{video_id}.credit.txt"
+        if cache_path.exists():
+            cached = cache_path.read_text(encoding="utf-8").strip()
+            if cached:
+                return cached
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        command = _ytdlp_base() + [
+            "--skip-download",
+            "--no-warnings",
+            "--print",
+            "%(uploader_id)s||%(channel)s||%(uploader)s||%(channel_url)s",
+            url,
+        ]
+        out = subprocess.run(command, capture_output=True, text=True, timeout=25)
+        raw = (out.stdout or "").strip().splitlines()
+        line = raw[-1].strip() if raw else ""
+        parts = [p.strip() for p in line.split("||")]
+        credit = ""
+        for p in parts:
+            if p and p.lower() != "na" and p.startswith("@"):
+                credit = p
+                break
+        if not credit:
+            # Fallback: build a handle from channel/uploader name.
+            for p in parts:
+                if p and p.lower() != "na":
+                    # channel_url like https://www.youtube.com/@handle → keep handle
+                    if "youtube.com/@" in p:
+                        credit = "@" + p.split("/@")[-1].split("/")[0].strip()
+                        break
+            if not credit:
+                for p in parts:
+                    if p and p.lower() != "na":
+                        credit = p if p.startswith("@") else f"@{p.replace(' ', '')}"
+                        break
+        if credit:
+            try:
+                cache_path.write_text(credit, encoding="utf-8")
+            except OSError:
+                pass
+            return credit
+    except Exception:
+        logger.debug("Could not fetch credit for video_id=%s", video_id, exc_info=True)
+    return ""
+
+
+def get_video_dimensions(input_path: Path):
+    output = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(input_path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    width, height = map(int, output.split(","))
+    return width, height
+
+
+def get_video_duration(input_path: Path) -> float:
+    output = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(input_path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return float(output)
