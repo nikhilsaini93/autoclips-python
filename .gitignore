@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+cookies.txt
+**/cookies*.txt
 
 # Python caches
 __pycache__/
