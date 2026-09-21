@@ -10,7 +10,13 @@ from app.services.video.process import run
 logger = logging.getLogger(__name__)
 
 MAX_DOWNLOAD_ATTEMPTS = 2
-
+# Tried in order. Chunked + IPv4 fixes the "N bytes read, M more expected" cut-offs
+# YouTube applies to datacenter IPs; the second attempt uses HLS via other clients.
+DOWNLOAD_ATTEMPTS = [
+    ["--http-chunk-size", "10M", "--force-ipv4"],
+    ["--http-chunk-size", "10M", "--force-ipv4",
+     "--extractor-args", "youtube:player_client=tv,web_safari"],
+]
 
 def _cookies_file() -> str:
     """Configured cookies file if it exists, else '' (never pass missing file)."""
@@ -82,21 +88,20 @@ def download_video(video_id: str) -> Path:
     t0 = time.perf_counter()
     base, url = _base_command(video_id)
 
-    command = base + [
+
+    format_args = [
         # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
         # which matters since clips get re-decoded multiple times
         # (face-detection frame grabs + the final cut/subtitle burn)
-        "-f",
-        "bv*[vcodec^=avc1]+ba/bv*+ba/b",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        str(output_path),
+        "-f", "bv*[vcodec^=avc1]+ba/bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", str(output_path),
         url,
     ]
 
     last_err: Exception | None = None
-    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+    for attempt, extra in enumerate(DOWNLOAD_ATTEMPTS, start=1):
+        command = base + extra + format_args
         try:
             run(command)
             last_err = None
@@ -105,16 +110,19 @@ def download_video(video_id: str) -> Path:
             last_err = e
             logger.warning(
                 "Download attempt %d/%d failed for %s: %s",
-                attempt, MAX_DOWNLOAD_ATTEMPTS, video_id, _error_text(e),
+                attempt, len(DOWNLOAD_ATTEMPTS), video_id, _error_text(e),
             )
-            try:
-                if output_path.exists():
-                    output_path.unlink()
-            except OSError:
-                pass
-            if attempt < MAX_DOWNLOAD_ATTEMPTS:
+            # remove partial output and leftovers like *.f137.mp4 / *.part
+            for leftover in DOWNLOAD_DIR.glob(f"{video_id}*"):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            if attempt < len(DOWNLOAD_ATTEMPTS):
                 time.sleep(3)
 
+    if last_err is not None:
+        raise last_err
     if last_err is not None:
         raise last_err
 
