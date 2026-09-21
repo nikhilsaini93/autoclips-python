@@ -1,22 +1,28 @@
 import logging
+import re
 import shutil
 import subprocess
+import sys
 import time
+from collections import deque
 from pathlib import Path
 
 from app.config import DOWNLOAD_DIR, TMP_DIR, settings
-from app.services.video.process import run
 
 logger = logging.getLogger(__name__)
 
-MAX_DOWNLOAD_ATTEMPTS = 2
 # Tried in order. Chunked + IPv4 fixes the "N bytes read, M more expected" cut-offs
-# YouTube applies to datacenter IPs; the second attempt uses HLS via other clients.
+# YouTube applies to datacenter IPs (e.g. Colab); the second attempt uses other
+# player clients (HLS) as a fallback.
 DOWNLOAD_ATTEMPTS = [
     ["--http-chunk-size", "10M", "--force-ipv4"],
     ["--http-chunk-size", "10M", "--force-ipv4",
      "--extractor-args", "youtube:player_client=tv,web_safari"],
 ]
+
+_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+PROGRESS_REFRESH = 0.3  # seconds between redraws of the progress line
+
 
 def _cookies_file() -> str:
     """Configured cookies file if it exists, else '' (never pass missing file)."""
@@ -73,11 +79,71 @@ def _error_text(e: Exception) -> str:
     return stderr[-800:] if stderr else str(e)
 
 
+def _run_with_progress(command: list, video_id: str) -> None:
+    """Run yt-dlp and show live progress on ONE terminal line (overwritten in place).
+
+    Raises CalledProcessError (with the output tail in .stderr) on failure,
+    so _error_text() and the retry loop keep working.
+    """
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    tail = deque(maxlen=30)  # last lines, kept for error reporting
+    last_draw = 0.0
+    progress_active = False  # True while a progress line is on screen
+    width = 0
+
+    def end_progress_line() -> None:
+        nonlocal progress_active
+        if progress_active:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            progress_active = False
+
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        tail.append(line)
+
+        if _PROGRESS_RE.search(line):
+            now = time.monotonic()
+            done = "100%" in line
+            if done or now - last_draw >= PROGRESS_REFRESH:
+                text = f"[{video_id}] {line}"
+                width = max(width, len(text))
+                sys.stdout.write("\r" + text.ljust(width))  # pad to erase leftovers
+                sys.stdout.flush()
+                progress_active = True
+                last_draw = now
+            if done:
+                end_progress_line()  # finish this line; next stream starts fresh
+        else:
+            end_progress_line()
+            if line.startswith(("[download]", "[Merger]", "[info]")):
+                logger.info("[%s] %s", video_id, line)
+            else:
+                logger.debug("[%s] %s", video_id, line)
+
+    end_progress_line()
+    returncode = proc.wait()
+    if returncode != 0:
+        out = "\n".join(tail)
+        raise subprocess.CalledProcessError(returncode, command, output=out, stderr=out)
+
+
 def download_video(video_id: str) -> Path:
     """Downloads (once) and caches the source video on disk, keyed by video_id.
 
-    Retries once because YouTube flags shared datacenter IPs (e.g. Colab)
-    intermittently. Raises the last error if all attempts fail.
+    Retries with different yt-dlp options because YouTube flags shared datacenter
+    IPs (e.g. Colab) intermittently. Raises the last error if all attempts fail.
     """
     output_path = DOWNLOAD_DIR / f"{video_id}.mp4"
     if output_path.exists():
@@ -88,8 +154,8 @@ def download_video(video_id: str) -> Path:
     t0 = time.perf_counter()
     base, url = _base_command(video_id)
 
-
     format_args = [
+        "--newline",  # one progress update per line (needed to read it from a pipe)
         # prefer H.264 (avc1) - decodes much faster on CPU than AV1/VP9,
         # which matters since clips get re-decoded multiple times
         # (face-detection frame grabs + the final cut/subtitle burn)
@@ -103,7 +169,7 @@ def download_video(video_id: str) -> Path:
     for attempt, extra in enumerate(DOWNLOAD_ATTEMPTS, start=1):
         command = base + extra + format_args
         try:
-            run(command)
+            _run_with_progress(command, video_id)
             last_err = None
             break
         except Exception as e:
@@ -121,8 +187,6 @@ def download_video(video_id: str) -> Path:
             if attempt < len(DOWNLOAD_ATTEMPTS):
                 time.sleep(3)
 
-    if last_err is not None:
-        raise last_err
     if last_err is not None:
         raise last_err
 
