@@ -4,13 +4,15 @@ import time
 import uuid
 from pathlib import Path
 
-from app.config import TMP_DIR, settings
+from app.config import ROOT, TMP_DIR, settings
 from app.services.video.download import get_video_dimensions
 from app.services.video.faces import detect_face_center_x
 from app.services.video.process import run
-from app.services.video.subtitles import write_srt
+from app.services.video.subtitles import write_ass
 
 logger = logging.getLogger(__name__)
+
+FONTS_DIR = ROOT / "assets" / "fonts"
 
 
 def render_video(
@@ -47,17 +49,20 @@ def render_video(
 
     srt_path: Path | None = None
     if words:
-        srt_path = TMP_DIR / f"sub-{os.getpid()}-{uuid.uuid4().hex[:8]}.srt"
-        has_subs = write_srt(words, start_sec, end_sec, srt_path)
+        # Poppins Bold Italic (true) + random-pop colors via ASS.
+        # Style lives inside the ASS (see subtitles.write_ass); fontsdir
+        # lets libass find assets/fonts/Poppins-*.
+        srt_path = TMP_DIR / f"sub-{os.getpid()}-{uuid.uuid4().hex[:8]}.ass"
+        has_subs = write_ass(
+            words, start_sec, end_sec, srt_path,
+            font=settings.SUBTITLE_FONT,
+            fontsize=settings.SUBTITLE_FONTSIZE,
+        )
         if has_subs:
             # ffmpeg's subtitles filter needs ':' escaped inside the path arg
             escaped_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
-            style = (
-                "FontName=DejaVu Sans,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,"
-                "Alignment=2,MarginV=60"
-            )
-            vf_parts.append(f"subtitles='{escaped_path}':force_style='{style}'")
+            fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
+            vf_parts.append(f"subtitles='{escaped_path}':fontsdir='{fontsdir}'")
 
     vf = ",".join(vf_parts)
     duration_sec = end_sec - start_sec
@@ -80,7 +85,7 @@ def render_video(
             str(output_path),
         ])
     finally:
-        # Always clean up the per-render SRT so tmp/ doesn't grow forever.
+        # Always clean up the per-render ASS so tmp/ doesn't grow forever.
         try:
             if srt_path is not None and srt_path.exists():
                 srt_path.unlink()

@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     YOUTUBE_COOKIES_FILE: str = ""
 
+    # Subtitle style (Poppins Bold Italic + random-pop, chosen via previews).
+    SUBTITLE_FONT: str = "Poppins"
+    SUBTITLE_FONTSIZE: int = 72
+    SUBTITLE_BOLD: bool = True
+    SUBTITLE_ITALIC: bool = True
+    SUBTITLE_COLOR_MODE: str = "random-pop"
+
     # YouTube Data API v3 uploads (Unlisted) for approved Telegram clips.
     YT_CLIENT_ID: str = ""
     YT_CLIENT_SECRET: str = ""
