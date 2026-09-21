@@ -185,14 +185,23 @@ def words_to_segments(words: list, max_words: int = 24) -> list:
 
 
 def transcribe_words_native(video_id: str, video_path: Path) -> dict:
-    """Auto-detects the spoken language and transcribes in that language's
-    native script (no translation). Used to feed the viral-clip finder."""
+    """Transcribes the spoken words exactly as spoken (STT, no translation).
+
+    Auto-detects the language and preserves the speaker's original wording,
+    including Hinglish code-switching (e.g. "Aaj we will discuss the new
+    feature."). Used to feed the viral-clip finder and for native burn-in."""
     return _transcribe_words(video_id, video_path, language=None, task="transcribe")
 
 
 def transcribe_words_english(video_id: str, video_path: Path) -> list:
-    """Whisper's 'translate' task converts speech in any source language straight to English text."""
-    return _transcribe_words(video_id, video_path, language=None, task="translate")["words"]
+    """Transcribes the original English speech directly via STT (no translation).
+
+    Uses Whisper's 'transcribe' task with language='en' so subtitles come
+    from what was actually spoken in English. Preserves the speaker's exact
+    meaning/wording (only obvious transcription errors corrected by the
+    model itself); names, technical terms, product names and acronyms are
+    kept as spoken. Never translates non-English audio."""
+    return _transcribe_words(video_id, video_path, language="en", task="transcribe")["words"]
 
 
 def words_to_transcript_text(words: list, segments: list | None = None, silences: list | None = None) -> str:

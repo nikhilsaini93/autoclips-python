@@ -2,7 +2,7 @@
 
 FastAPI server with four routes + Telegram bot:
 
-1. `POST /subtitles/english` — transcribe + translate a YouTube video's speech to English (`.srt`, or a burned-in-subtitles `.mp4`)
+1. `POST /subtitles/english` — transcribe the video's original English speech to English via STT (`.srt`, or a burned-in-subtitles `.mp4`)
 2. `POST /clip` — cut a clip from a YouTube video between `start` and `end`, with an optional 9:16 face-aware crop and burned-in subtitles (`none` | `english` | `native`)
 3. `POST /clips/analyze` — AI-only analysis, no video rendering. The model decides on its own how many clips are worth cutting (not a fixed number), and returns each one's timestamps, upload-ready YT title (same language as the audio), hashtags, description, confidence score, and reasoning as JSON.
 4. `POST /clips/viral` — same AI analysis as above, but actually renders **every** clip it finds — not just the first one. Sends each `.mp4` to Telegram and returns JSON metadata (`clip_id/file/title/hashtags/description/score/reason`).
@@ -72,7 +72,7 @@ curl -X POST http://localhost:8000/clip \
   -d '{"url": "https://www.youtube.com/watch?v=VIDEO_ID", "start": "00:01:20", "end": "00:01:55", "subtitles": "native"}' \
   -o clip.mp4
 ```
-`subtitles` is `none` | `english` (translated) | `native` (as spoken, e.g. Hindi). Native reuses the same transcript as clip detection, so timing aligns exactly.
+`subtitles` is `none` | `english` (STT of original English speech, no translation) | `native` (STT as spoken, Hinglish preserved). Native reuses the same transcript as clip detection, so timing aligns exactly.
 
 **Every viral clip Gemini finds (no cap — could be 1, could be 10+), vertical + native captions, sent to Telegram:**
 ```bash
@@ -137,7 +137,7 @@ Set verbosity with `LOG_LEVEL` in `.env` (`DEBUG` also logs every ffmpeg/yt-dlp 
 
 - Every route downloads (and caches on disk under `storage/downloads/`) the source video once per `video_id`, and Whisper transcripts are cached under `storage/tmp/` per `(video_id, language, task)` — so calling multiple routes against the same video reuses work instead of redoing it.
 - Routes are defined as regular (non-`async`) functions on purpose: FastAPI runs blocking `def` routes in a threadpool, which is what you want here since `yt-dlp`, Whisper, `ffmpeg`, and the Gemini call all block.
-- Subtitles are `none` | `english` (Whisper translate) | `native` (as spoken). `/clips/analyze` and `/clips/viral` always analyze the *native-language* transcript (auto-detected) so clip boundaries line up with what's actually said; the burn-in track follows the `subtitles` you pick. Whisper defaults to the `small` model for better Hindi/Hinglish accuracy (override via `WHISPER_MODEL_SIZE`).
+- Subtitles are `none` | `english` (Whisper transcribe with `language=en`, STT-only) | `native` (Whisper transcribe auto-detect, as spoken with Hinglish preserved). `/clips/analyze` and `/clips/viral` always analyze the *native-language* transcript (auto-detected) so clip boundaries line up with what's actually said; the burn-in track follows the `subtitles` you pick. Whisper defaults to the `small` model for better Hindi/Hinglish accuracy (override via `WHISPER_MODEL_SIZE`).
 - Neither route hard-caps the clip count by default — Gemini is asked for every clip that's genuinely viral-worthy and decides that count itself (pass `max_clips` if you want a ceiling). Malformed candidates (bad timestamps, end before start) are skipped with a warning rather than failing the whole batch.
 - For long videos, requests can take a while (download + transcribe + ffmpeg encode all happen synchronously within the request; `/clips/viral` does this once per clip). Telegram flows report progress via `GET /jobs/{job_id}`; the natural next step if this needs to scale further is a durable queue (e.g. Celery/RQ) instead of in-memory jobs.
 

@@ -21,8 +21,10 @@ router = APIRouter()
 @router.post("/subtitles/english")
 @limiter.limit("20/minute")
 def subtitles_english(request: Request, req: SubtitleRequest):
-    """Transcribes the video and translates it to English (works even if the
-    source audio is Hindi/Urdu/etc, via Whisper's translate task)."""
+    """Transcribes the video's original English speech directly via STT
+    (no translation). Preserves the speaker's exact wording/meaning —
+    names, technical terms and acronyms kept as spoken — with sentence
+    segmentation and word timestamps synced to the audio."""
     logger.info("english subtitles requested url=%s burn_in=%s vertical_crop=%s", req.url, req.burn_in, req.vertical_crop)
     video_id, video_path = prepare(req.url)
     words = transcribe_words_english(video_id, video_path)

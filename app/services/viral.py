@@ -35,9 +35,11 @@ def subtitle_label(value: str) -> str:
 
 
 def resolve_subtitle_words(video_id: str, video_path, subtitles: str):
-    """Returns word list for burning, or None. 'native' reuses the
-    as-spoken transcript (timestamps align exactly with clip boundaries);
-    'english' uses Whisper's translate task."""
+    """Returns word list for burning, or None. Both tracks are STT-only
+    (transcription, never translation, timestamps synced to speech):
+    'native' reuses the as-spoken transcript (Hinglish preserved, timestamps
+    align exactly with clip boundaries); 'english' transcribes the original
+    English speech directly."""
     if subtitles == "english":
         return transcribe_words_english(video_id, video_path)
     if subtitles == "native":

@@ -19,7 +19,7 @@ class ClipRequest(BaseModel):
     end: str = Field(..., description="End time — 'HH:MM:SS', 'MM:SS', or seconds")
     vertical_crop: bool = Field(True, description="Crop to 9:16 vertical using face detection")
     subtitles: Literal["none", "english", "native"] = Field(
-        "none", description="Burn subtitles into the clip: none, english (translated), or native (as spoken)"
+        "none", description="Burn subtitles into the clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )
 
 
@@ -48,5 +48,5 @@ class ViralClipsRequest(BaseModel):
     )
     vertical_crop: bool = Field(True, description="Crop each clip to 9:16 vertical using face detection")
     subtitles: Literal["none", "english", "native"] = Field(
-        "english", description="Burn subtitles into each clip: none, english (translated), or native (as spoken)"
+        "english", description="Burn subtitles into each clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )

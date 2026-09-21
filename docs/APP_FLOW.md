@@ -127,7 +127,7 @@ flowchart LR
     C --> S["resolve_subtitle_words - english, native, none"]
     S --> R2["render one cut"]
     E["POST subtitles-english"] --> P
-    E --> T["Whisper translate task"]
+    E --> T["Whisper transcribe task (language=en, STT-only)"]
     T --> O["srt file or burned MP4"]
 ```
 
@@ -142,7 +142,7 @@ flowchart TB
     URL["YouTube URL"] --> ID["video.ids.get_video_id"]
     ID --> DW["video.download.download_video - yt-dlp H264 to downloads cache"]
     DW --> CR["video.download.get_video_credit - handle via yt-dlp meta"]
-    DW --> TRN["video.transcribe - native task or english task plus cache"]
+    DW --> TRN["video.transcribe - native (auto) or english (en) transcribe plus cache"]
     TRN --> TXT["words_to_transcript_text - 12 words per line"]
     TXT --> GEM["video.gemini.find_viral_clips - 20 to 60s, no overlap, ranked"]
     GEM --> DESC["youtube.descriptions.build_yt_description - footer plus fair-use"]
@@ -155,7 +155,7 @@ flowchart TB
 Notes / design choices (see README):
 
 - Download + transcript caches mean repeat calls on the same `video_id` reuse work.
-- `native` subtitles reuse the exact words used for detection → boundaries line up; `english` is a separate Whisper translate pass.
+- `native` subtitles reuse the exact words used for detection → boundaries line up; `english` is a separate Whisper transcribe pass (`language=en`, STT-only, no translation).
 - Gemini count is open-ended (1–10+); `max_clips` only caps. Bad timestamps / `end<=start` are skipped with a warning, never fail the batch.
 - Long videos are slow (download + transcribe + N×ffmpeg, synchronously in-request). Telegram jobs expose progress; next scale step would be Celery/RQ instead of in-memory `jobs`.
 
