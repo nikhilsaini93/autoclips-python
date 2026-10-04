@@ -92,7 +92,7 @@ def test_viral_clamps_overlong_candidate(monkeypatch, tmp_path):
     monkeypatch.setattr(viral_mod, "analyze_viral_clips", lambda *a: [candidate])
     monkeypatch.setattr(viral_mod, "resolve_subtitle_words", lambda *a: None)
 
-    def fake_render(video_path, output_path, start, end, words=None, vertical_crop=True):
+    def fake_render(video_path, output_path, start, end, words=None, vertical_crop=True, processing_mode="face_detection"):
         rendered["start"] = start
         rendered["end"] = end
 

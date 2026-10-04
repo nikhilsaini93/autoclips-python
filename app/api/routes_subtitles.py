@@ -25,7 +25,7 @@ def subtitles_english(request: Request, req: SubtitleRequest):
     (no translation). Preserves the speaker's exact wording/meaning —
     names, technical terms and acronyms kept as spoken — with sentence
     segmentation and word timestamps synced to the audio."""
-    logger.info("english subtitles requested url=%s burn_in=%s vertical_crop=%s", req.url, req.burn_in, req.vertical_crop)
+    logger.info("english subtitles requested url=%s burn_in=%s vertical_crop=%s processing_mode=%s", req.url, req.burn_in, req.vertical_crop, req.processing_mode)
     video_id, video_path = prepare(req.url)
     words = transcribe_words_english(video_id, video_path)
     duration = get_video_duration(video_path)
@@ -38,6 +38,14 @@ def subtitles_english(request: Request, req: SubtitleRequest):
         return FileResponse(srt_path, filename=f"{video_id}-english.srt", media_type="application/x-subrip")
 
     output_path = CLIPS_DIR / f"{video_id}-english-{uuid.uuid4().hex[:8]}.mp4"
-    render_video(video_path, output_path, 0.0, duration, words=words, vertical_crop=req.vertical_crop)
+    render_video(
+        video_path,
+        output_path,
+        0.0,
+        duration,
+        words=words,
+        vertical_crop=req.vertical_crop,
+        processing_mode=req.processing_mode,
+    )
     logger.info("Returning english mp4 for video_id=%s -> %s", video_id, output_path.name)
     return FileResponse(output_path, filename=output_path.name, media_type="video/mp4")

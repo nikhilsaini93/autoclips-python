@@ -6,7 +6,6 @@ from pathlib import Path
 
 from app.config import ROOT, TMP_DIR, settings
 from app.services.video.download import get_video_dimensions
-from app.services.video.faces import detect_face_center_x
 from app.services.video.process import run
 from app.services.video.subtitles import write_ass
 
@@ -22,10 +21,17 @@ def render_video(
     end_sec: float,
     words: list | None = None,
     vertical_crop: bool = True,
+    processing_mode: str = "face_detection",
 ) -> None:
+    processing_mode = (processing_mode or "face_detection").lower()
+    if processing_mode not in ("face_detection", "no_face_detection"):
+        raise ValueError(
+            f"Unknown processing_mode={processing_mode!r} "
+            "(expected 'face_detection' or 'no_face_detection')"
+        )
     logger.info(
-        "Rendering %s -> %s [%.1f, %.1f] vertical_crop=%s subtitles=%s",
-        input_path, output_path, start_sec, end_sec, vertical_crop, bool(words),
+        "Rendering %s -> %s [%.1f, %.1f] vertical_crop=%s processing_mode=%s subtitles=%s",
+        input_path, output_path, start_sec, end_sec, vertical_crop, processing_mode, bool(words),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
@@ -34,18 +40,30 @@ def render_video(
     vf_parts = ["setpts=PTS-STARTPTS"]
 
     if vertical_crop:
-        # Allow skipping face detection for speed (center crop fallback)
-        if settings.SKIP_FACE_DETECT:
-            logger.info("SKIP_FACE_DETECT=1 — using center crop")
-            face_center_x = width / 2
+        if processing_mode == "no_face_detection":
+            # Simple 9:16 canvas: fit original inside 1080x1920, center it,
+            # fill the rest with black. No face/person detection, no tracking,
+            # no AI vision — pure ffmpeg scaling + padding.
+            vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+            vf_parts.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black")
+            vf_parts.append("setsar=1")
         else:
-            face_center_x = detect_face_center_x(input_path, start_sec, end_sec, width)
-        crop_width = round(height * 9 / 16)
-        x = round(face_center_x - crop_width / 2)
-        x = max(0, min(x, width - crop_width))
-        vf_parts.append(f"crop={crop_width}:{height}:{x}:0")
-        vf_parts.append("scale=1080:1920")
-        vf_parts.append("setsar=1")
+            # Existing smart-crop pipeline. Lazy import so the face-detection
+            # module (and its heavy deps) is never touched in no-face mode.
+            from app.services.video.faces import detect_face_center_x
+
+            # Allow skipping face detection for speed (center crop fallback)
+            if settings.SKIP_FACE_DETECT:
+                logger.info("SKIP_FACE_DETECT=1 — using center crop")
+                face_center_x = width / 2
+            else:
+                face_center_x = detect_face_center_x(input_path, start_sec, end_sec, width)
+            crop_width = round(height * 9 / 16)
+            x = round(face_center_x - crop_width / 2)
+            x = max(0, min(x, width - crop_width))
+            vf_parts.append(f"crop={crop_width}:{height}:{x}:0")
+            vf_parts.append("scale=1080:1920")
+            vf_parts.append("setsar=1")
 
     srt_path: Path | None = None
     if words:

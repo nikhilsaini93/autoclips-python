@@ -87,6 +87,18 @@ async def ask_subtitles(query, context):
     )
 
 
+async def ask_processing_mode(query, context):
+    keyboard = [
+        [InlineKeyboardButton("9:16 + Face Detection", callback_data="proc:face_detection")],
+        [InlineKeyboardButton("9:16 Without Face Detection", callback_data="proc:no_face_detection")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")],
+    ]
+    await query.edit_message_text(
+        "Choose 9:16 processing mode:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 def parse_timestamp_range(value: str):
     value = value.strip()
 

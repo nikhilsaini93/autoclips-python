@@ -11,6 +11,10 @@ class SubtitleRequest(BaseModel):
     vertical_crop: bool = Field(
         False, description="Only used when burn_in=true: crop the video to 9:16 vertical (face-aware)."
     )
+    processing_mode: Literal["face_detection", "no_face_detection"] = Field(
+        "face_detection",
+        description="9:16 processing mode when vertical_crop=true: face_detection (smart crop) or no_face_detection (center + black pad, no face detection).",
+    )
 
 
 class ClipRequest(BaseModel):
@@ -18,6 +22,10 @@ class ClipRequest(BaseModel):
     start: str = Field(..., description="Start time — 'HH:MM:SS', 'MM:SS', or seconds")
     end: str = Field(..., description="End time — 'HH:MM:SS', 'MM:SS', or seconds")
     vertical_crop: bool = Field(True, description="Crop to 9:16 vertical using face detection")
+    processing_mode: Literal["face_detection", "no_face_detection"] = Field(
+        "face_detection",
+        description="9:16 processing mode when vertical_crop=true: face_detection (smart crop) or no_face_detection (center + black pad, no face detection).",
+    )
     subtitles: Literal["none", "english", "native"] = Field(
         "none", description="Burn subtitles into the clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )
@@ -47,6 +55,10 @@ class ViralClipsRequest(BaseModel):
         None, ge=1, description="Cap the number of clips. Omit to get every viral-worthy clip Gemini finds (typically 6-10)."
     )
     vertical_crop: bool = Field(True, description="Crop each clip to 9:16 vertical using face detection")
+    processing_mode: Literal["face_detection", "no_face_detection"] = Field(
+        "face_detection",
+        description="9:16 processing mode when vertical_crop=true: face_detection (smart crop) or no_face_detection (center + black pad, no face detection).",
+    )
     subtitles: Literal["none", "english", "native"] = Field(
         "english", description="Burn subtitles into each clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )

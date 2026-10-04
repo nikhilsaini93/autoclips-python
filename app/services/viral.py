@@ -34,6 +34,13 @@ def subtitle_label(value: str) -> str:
     return {"english": "English", "native": "Native", "none": "NO"}.get(value, value)
 
 
+def processing_mode_label(value: str) -> str:
+    return {
+        "face_detection": "9:16 + Face Detection",
+        "no_face_detection": "9:16 Without Face Detection",
+    }.get(value or "face_detection", value)
+
+
 def resolve_subtitle_words(video_id: str, video_path, subtitles: str):
     """Returns word list for burning, or None. Both tracks are STT-only
     (transcription, never translation, timestamps synced to speech):
@@ -121,10 +128,11 @@ async def generate_viral_clips(req, job_id: str | None = None):
             update_job(job_id, **fields)
 
     logger.info(
-        "viral clips requested url=%s max_clips=%s vertical_crop=%s subtitles=%s",
+        "viral clips requested url=%s max_clips=%s vertical_crop=%s processing_mode=%s subtitles=%s",
         req.url,
         req.max_clips,
         req.vertical_crop,
+        getattr(req, "processing_mode", "face_detection"),
         req.subtitles,
     )
 
@@ -205,6 +213,7 @@ async def generate_viral_clips(req, job_id: str | None = None):
             end_sec,
             words=subtitle_words,
             vertical_crop=req.vertical_crop,
+            processing_mode=getattr(req, "processing_mode", "face_detection"),
         )
 
         entries.append({

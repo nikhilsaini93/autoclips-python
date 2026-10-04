@@ -22,8 +22,8 @@ def clip(request: Request, req: ClipRequest):
     """Cuts [start, end] out of the video, optionally with a 9:16 face-aware
     crop and/or burned-in English subtitles."""
     logger.info(
-        "clip requested url=%s start=%s end=%s vertical_crop=%s subtitles=%s",
-        req.url, req.start, req.end, req.vertical_crop, req.subtitles,
+        "clip requested url=%s start=%s end=%s vertical_crop=%s processing_mode=%s subtitles=%s",
+        req.url, req.start, req.end, req.vertical_crop, req.processing_mode, req.subtitles,
     )
     video_id, video_path = prepare(req.url)
     start_sec = time_to_seconds(req.start)
@@ -34,6 +34,14 @@ def clip(request: Request, req: ClipRequest):
     words = resolve_subtitle_words(video_id, video_path, req.subtitles)
 
     output_path = CLIPS_DIR / f"{video_id}-clip-{uuid.uuid4().hex[:8]}.mp4"
-    render_video(video_path, output_path, start_sec, end_sec, words=words, vertical_crop=req.vertical_crop)
+    render_video(
+        video_path,
+        output_path,
+        start_sec,
+        end_sec,
+        words=words,
+        vertical_crop=req.vertical_crop,
+        processing_mode=req.processing_mode,
+    )
     logger.info("Returning clip for video_id=%s -> %s", video_id, output_path.name)
     return FileResponse(output_path, filename=output_path.name, media_type="video/mp4")

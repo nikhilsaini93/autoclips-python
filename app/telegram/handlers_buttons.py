@@ -9,7 +9,7 @@ from app.telegram.cleanup_files import delete_all_files
 from app.telegram.handlers_approve import handle_approve, handle_deny
 from app.telegram.handlers_approve_meta import handle_approve_fb, handle_approve_ig
 from app.telegram.handlers_generate import run_ai_generation, run_timestamp_generation
-from app.telegram.handlers_start import ask_subtitles
+from app.telegram.handlers_start import ask_processing_mode, ask_subtitles
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,15 @@ async def telegram_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("subs:"):
         context.user_data["subtitles"] = data.split(":", 1)[1]
+        await ask_processing_mode(query, context)
+        return
+
+    if data.startswith("proc:"):
+        processing_mode = data.split(":", 1)[1]
+        if processing_mode not in ("face_detection", "no_face_detection"):
+            await query.edit_message_text("❌ Unknown processing mode. Send /start.")
+            return
+        context.user_data["processing_mode"] = processing_mode
 
         if context.user_data.get("mode") == "ai":
             await run_ai_generation(query, context)

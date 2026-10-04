@@ -12,6 +12,7 @@ from app.services.video.timeutils import time_to_seconds
 from app.services.viral import (
     generate_viral_clips,
     prepare,
+    processing_mode_label,
     resolve_subtitle_words,
     subtitle_label,
 )
@@ -30,6 +31,7 @@ async def run_ai_generation(query, context):
     url = context.user_data.get("youtube_url")
     max_clips = context.user_data.get("max_clips")
     subtitles = context.user_data.get("subtitles", "native")
+    processing_mode = context.user_data.get("processing_mode", "face_detection")
 
     if not url:
         await query.edit_message_text(
@@ -44,6 +46,7 @@ async def run_ai_generation(query, context):
         f"📥 Downloading video...\n"
         f"🎬 Clips: {'AI Decide' if max_clips is None else max_clips}\n"
         f"📝 Subtitles: {subtitle_label(subtitles)}\n"
+        f"🎞️ Mode: {processing_mode_label(processing_mode)}\n"
         f"🆔 Job: {job_id}\n\n"
         "This may take a while for long videos."
     )
@@ -58,7 +61,7 @@ async def run_ai_generation(query, context):
                 chat_id,
                 message_id,
                 job_id,
-                lambda job: format_ai_progress(job, max_clips, subtitles),
+                lambda job: format_ai_progress(job, max_clips, subtitles, processing_mode),
             )
         )
 
@@ -67,6 +70,7 @@ async def run_ai_generation(query, context):
             url=url,
             max_clips=max_clips,
             vertical_crop=True,
+            processing_mode=processing_mode,
             subtitles=subtitles,
         )
         # NOTE: generate_viral_clips is itself non-blocking towards the event
@@ -115,6 +119,7 @@ async def run_timestamp_generation(query, context):
     url = context.user_data.get("youtube_url")
     timestamp = context.user_data.get("timestamp")
     subtitles = context.user_data.get("subtitles", "native")
+    processing_mode = context.user_data.get("processing_mode", "face_detection")
 
     if not url or not timestamp:
         await query.edit_message_text(
@@ -131,6 +136,7 @@ async def run_timestamp_generation(query, context):
         f"📥 Downloading video...\n"
         f"⏱️ {start} → {end}\n"
         f"📝 Subtitles: {subtitle_label(subtitles)}\n"
+        f"🎞️ Mode: {processing_mode_label(processing_mode)}\n"
         f"🆔 Job: {job_id}"
     )
 
@@ -145,7 +151,7 @@ async def run_timestamp_generation(query, context):
                 chat_id,
                 message_id,
                 job_id,
-                lambda job: format_timestamp_progress(job, start, end, subtitles),
+                lambda job: format_timestamp_progress(job, start, end, subtitles, processing_mode),
             )
         )
 
@@ -178,6 +184,7 @@ async def run_timestamp_generation(query, context):
             time_to_seconds(end),
             words=words,
             vertical_crop=True,
+            processing_mode=processing_mode,
         )
 
         update_job(job_id, progress="sending", stage="sending", percent=92)

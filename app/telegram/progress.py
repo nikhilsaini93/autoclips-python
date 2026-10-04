@@ -5,7 +5,7 @@ import time
 from telegram.error import RetryAfter, TelegramError, TimedOut
 
 from app.services.jobs import jobs
-from app.services.viral import subtitle_label
+from app.services.viral import processing_mode_label, subtitle_label
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ _STAGE_LABELS = {
 }
 
 
-def format_ai_progress(job: dict, max_clips, subtitles: str) -> str:
+def format_ai_progress(job: dict, max_clips, subtitles: str, processing_mode: str = "face_detection") -> str:
     percent = int(job.get("percent", 0) or 0)
     stage = job.get("stage", "") or job.get("progress", "")
     total = int(job.get("total_clips", 0) or 0)
@@ -55,12 +55,13 @@ def format_ai_progress(job: dict, max_clips, subtitles: str) -> str:
         f"{progress_bar(percent)}\n"
         f"{label}{counter}\n"
         f"📝 Subtitles: {subtitle_label(subtitles)}\n"
+        f"🎞️ Mode: {processing_mode_label(processing_mode)}\n"
         f"⏱️ Elapsed: {format_elapsed(job)}\n"
         f"🆔 Job: {job.get('job_id', '')}"
     )
 
 
-def format_timestamp_progress(job: dict, start: str, end: str, subtitles: str) -> str:
+def format_timestamp_progress(job: dict, start: str, end: str, subtitles: str, processing_mode: str = "face_detection") -> str:
     percent = int(job.get("percent", 0) or 0)
     stage = job.get("stage", "") or job.get("progress", "")
     label = _STAGE_LABELS.get(stage, stage or "Working...")
@@ -70,6 +71,7 @@ def format_timestamp_progress(job: dict, start: str, end: str, subtitles: str) -
         f"{label}\n"
         f"⏱️ {start} → {end}\n"
         f"📝 Subtitles: {subtitle_label(subtitles)}\n"
+        f"🎞️ Mode: {processing_mode_label(processing_mode)}\n"
         f"⏱️ Elapsed: {format_elapsed(job)}\n"
         f"🆔 Job: {job.get('job_id', '')}"
     )
