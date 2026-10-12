@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     SUBTITLE_ITALIC: bool = True
     SUBTITLE_COLOR_MODE: str = "random-pop"
 
+    # Upper AI-title overlay for 9:16 no-face mode. Same Poppins Bold
+    # Italic + random-pop style as subtitles, top-center (ASS
+    # Alignment=8). MarginV 280 lands inside the top black bar of a
+    # letterboxed 1080x1920 canvas.
+    TITLE_MARGINV: int = 280
+
     # YouTube Data API v3 uploads (Unlisted) for approved Telegram clips.
     YT_CLIENT_ID: str = ""
     YT_CLIENT_SECRET: str = ""

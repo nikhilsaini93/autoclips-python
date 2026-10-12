@@ -10,7 +10,9 @@ from app.services.jobs import create_job, update_job
 from app.services.video.render import render_video
 from app.services.video.timeutils import time_to_seconds
 from app.services.viral import (
+    analyze_viral_clips,
     generate_viral_clips,
+    pick_title_for_range,
     prepare,
     processing_mode_label,
     resolve_subtitle_words,
@@ -171,27 +173,53 @@ async def run_timestamp_generation(query, context):
             else None
         )
 
+        # Upper AI title in 9:16 no-face mode: reuse the AI viral analysis
+        # and borrow the nearest overlapping clip title for the range.
+        # Any failure falls back to a title-less render — never fails.
+        start_sec = time_to_seconds(start)
+        end_sec = time_to_seconds(end)
+        clip_title: str | None = None
+        if processing_mode == "no_face_detection":
+            try:
+                update_job(job_id, progress="analyzing title", stage="analyzing", percent=65)
+                candidates = await asyncio.to_thread(
+                    analyze_viral_clips, video_id, video_path, None,
+                )
+                clip_title = await asyncio.to_thread(
+                    pick_title_for_range, candidates, start_sec, end_sec,
+                )
+                if clip_title:
+                    logger.info("Timestamp auto-title: '%s' for [%s -> %s]", clip_title, start, end)
+            except Exception:
+                logger.exception("Timestamp auto-title failed, rendering without title")
+                clip_title = None
+
         output_path = (
             CLIPS_DIR / f"{video_id}-timestamp-{uuid.uuid4().hex[:8]}.mp4"
         )
 
         update_job(job_id, progress="rendering", stage="rendering", percent=75)
+        ts_render_kwargs: dict = {
+            "words": words,
+            "vertical_crop": True,
+            "processing_mode": processing_mode,
+        }
+        if clip_title:
+            ts_render_kwargs["title"] = clip_title
         await asyncio.to_thread(
             render_video,
             video_path,
             output_path,
-            time_to_seconds(start),
-            time_to_seconds(end),
-            words=words,
-            vertical_crop=True,
-            processing_mode=processing_mode,
+            start_sec,
+            end_sec,
+            **ts_render_kwargs,
         )
 
         update_job(job_id, progress="sending", stage="sending", percent=92)
         sent = await send_clip_to_telegram(
             video_path=output_path,
             clip_id=f"{video_id}-timestamp",
-            title="Timestamp Clip",
+            title=clip_title or "Timestamp Clip",
             score=None,
             reason=f"{start} → {end}",
         )

@@ -12,6 +12,13 @@ SUBTITLE_FONTSIZE = 72
 SUBTITLE_BOLD = -1  # ASS: -1 = true → selects Bold face
 SUBTITLE_ITALIC = -1  # ASS: -1 = true → selects true Italic face
 
+# Upper title style for 9:16 no-face mode: same Poppins Bold Italic +
+# random-pop, but top-center (Alignment=8) so it lands in the top black
+# bar instead of over the centered video. MarginV 280 keeps it inside the
+# ~656px top bar of a letterboxed 1080x1920 canvas.
+TITLE_MARGINV_DEFAULT = 280
+TITLE_WRAP_WIDTH = 20
+
 WHITE = "&H00FFFFFF&"
 POP_PALETTE = (
     "&H0000FFFF&",  # yellow
@@ -104,14 +111,42 @@ def _wrap_colored_words(colored: list[str], width: int = 14) -> str:
     return "\\N".join(" ".join(line) for line in lines)
 
 
+def _sanitize_title(title: str | None) -> str:
+    """Collapse whitespace/newlines and strip ASS override braces."""
+    if not title:
+        return ""
+    text = str(title).replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    # '{' / '}' open ASS override blocks — drop them so a title can never
+    # break parsing or inject styles.
+    text = text.replace("{", "").replace("}", "")
+    return text.strip()
+
+
+def _colorize_tokens(tokens: list[str], rng: random.Random) -> list[str]:
+    """Paint 1-2 random tokens in a pop color (shared by caps + title)."""
+    if not tokens:
+        return []
+    colors = [WHITE] * len(tokens)
+    for i in rng.sample(range(len(tokens)), k=min(2, len(tokens))):
+        colors[i] = rng.choice(POP_PALETTE)
+    return [
+        f"{{\\c{c}}}{tok}" if c != WHITE else tok
+        for tok, c in zip(tokens, colors)
+    ]
+
+
 def write_ass(
-    words: list,
+    words: list | None,
     start_sec: float,
     end_sec: float,
     ass_path: Path,
     seed: int | None = None,
     font: str = SUBTITLE_FONT,
     fontsize: int = SUBTITLE_FONTSIZE,
+    title: str | None = None,
+    title_marginv: int = TITLE_MARGINV_DEFAULT,
+    title_wrap_width: int = TITLE_WRAP_WIDTH,
 ) -> bool:
     """Writes an ASS with Poppins Bold Italic + random-pop word colors.
 
@@ -121,13 +156,19 @@ def write_ass(
 
     seed: for reproducible tests. None → random per render (seeded from
     time + pid so concurrent renders don't repeat the same colors).
+
+    title: optional upper clip title (9:16 no-face mode). Same font/style
+    as captions but top-center (Alignment=8) and visible for the full
+    clip duration [0, clip_duration]. Empty/None → no title event.
     """
     import os
     import time
 
     clip_duration = end_sec - start_sec
+    clean_title = _sanitize_title(title)
+    has_title = bool(clean_title)
     clip_words = []
-    for w in words:
+    for w in (words or []):
         if w["end"] <= start_sec or w["start"] >= end_sec:
             continue
         rel_start = max(0.0, w["start"] - start_sec)
@@ -136,7 +177,7 @@ def write_ass(
             continue
         clip_words.append({"start": rel_start, "end": rel_end, "text": w["text"]})
 
-    if not clip_words:
+    if not clip_words and not has_title:
         logger.warning(
             "No words fall inside [%.1f, %.1f] - not writing %s",
             start_sec, end_sec, ass_path,
@@ -146,7 +187,7 @@ def write_ass(
     if seed is None:
         seed = (int(time.time() * 1000) ^ os.getpid()) & 0xFFFFFFFF
 
-    chunks = chunk_words_for_captions(clip_words)
+    chunks = chunk_words_for_captions(clip_words) if clip_words else []
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -163,26 +204,40 @@ def write_ass(
         f"Style: Cap,{font},{fontsize},{WHITE},&H000000FF&,&H00000000&,"
         f"&H80000000&,{SUBTITLE_BOLD},{SUBTITLE_ITALIC},0,0,100,100,0,0,"
         "1,3,1,2,40,40,140,1\n"
+    )
+    if has_title:
+        header += (
+            f"Style: Title,{font},{fontsize},{WHITE},&H000000FF&,&H00000000&,"
+            f"&H80000000&,{SUBTITLE_BOLD},{SUBTITLE_ITALIC},0,0,100,100,0,0,"
+            f"1,3,1,8,40,40,{int(title_marginv)},1\n"
+        )
+    header += (
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header)
+        if has_title:
+            tokens = clean_title.split()
+            title_rng = random.Random((seed + 0x54414C45) & 0xFFFFFFFF)
+            colored = _colorize_tokens(tokens, title_rng)
+            title_text = _wrap_colored_words(colored, width=title_wrap_width)
+            f.write(
+                f"Dialogue: 0,{format_ass_timestamp(0)},"
+                f"{format_ass_timestamp(clip_duration)},Title,,0,0,0,,{title_text}\n"
+            )
         for idx, (rel_start, rel_end, text) in enumerate(chunks):
             tokens = text.split()
             rng = random.Random((seed + idx * 0x9E3779B1) & 0xFFFFFFFF)
-            colors = [WHITE] * len(tokens)
-            for i in rng.sample(range(len(tokens)), k=min(2, len(tokens))):
-                colors[i] = rng.choice(POP_PALETTE)
-            colored = [
-                f"{{\\c{c}}}{tok}" if c != WHITE else tok
-                for tok, c in zip(tokens, colors)
-            ]
+            colored = _colorize_tokens(tokens, rng)
             ass_text = _wrap_colored_words(colored)
             f.write(
                 f"Dialogue: 0,{format_ass_timestamp(rel_start)},"
                 f"{format_ass_timestamp(rel_end)},Cap,,0,0,0,,{ass_text}\n"
             )
-    logger.info("Wrote %s (%d caption lines, random-pop)", ass_path, len(chunks))
+    logger.info(
+        "Wrote %s (%d caption lines%s, random-pop)",
+        ass_path, len(chunks), ", +title" if has_title else "",
+    )
     return True

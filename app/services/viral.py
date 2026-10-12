@@ -105,6 +105,47 @@ def analyze_viral_clips(video_id: str, video_path, max_clips) -> list:
     return candidates
 
 
+def pick_title_for_range(candidates: list, start_sec: float, end_sec: float) -> str | None:
+    """Pick the AI title whose clip overlaps [start_sec, end_sec] most.
+
+    Used by timestamp + /clip flows to reuse the viral analysis: the
+    range is arbitrary (no candidate of its own), so the nearest Gemini
+    title is borrowed for the upper overlay. Returns None when nothing
+    usable is found (malformed timestamps, empty titles, or placeholder
+    'Untitled Clip'). Never raises — callers fall back to no-title render.
+    """
+    if not candidates:
+        return None
+    mid = (start_sec + end_sec) / 2.0
+    best_overlap_title: str | None = None
+    best_overlap = 0.0
+    nearest_title: str | None = None
+    nearest_dist: float | None = None
+    for c in candidates:
+        try:
+            cs = time_to_seconds(c.get("start"))
+            ce = time_to_seconds(c.get("end"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if ce <= cs:
+            continue
+        raw_title = (c.get("title") or "").strip()
+        if not raw_title or raw_title.lower() == "untitled clip":
+            continue
+        overlap = max(0.0, min(ce, end_sec) - max(cs, start_sec))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_overlap_title = raw_title
+        center = (cs + ce) / 2.0
+        dist = abs(center - mid)
+        if nearest_dist is None or dist < nearest_dist:
+            nearest_dist = dist
+            nearest_title = raw_title
+    if best_overlap > 0 and best_overlap_title:
+        return best_overlap_title
+    return nearest_title
+
+
 async def generate_viral_clips(req, job_id: str | None = None):
     """Generate viral clips and send each generated MP4 to Telegram.
 
@@ -205,15 +246,30 @@ async def generate_viral_clips(req, job_id: str | None = None):
             / f"{video_id}-viral-{i}-{uuid.uuid4().hex[:8]}.mp4"
         )
 
+        processing_mode = getattr(req, "processing_mode", "face_detection")
+        clip_title = (
+            (candidate.get("title") or "").strip()
+            if processing_mode == "no_face_detection" and req.vertical_crop
+            else ""
+        )
+        if clip_title.lower() == "untitled clip":
+            clip_title = ""
+        # Only pass title= when non-empty so older mocks/stubs of
+        # render_video without a title param keep working (face mode).
+        render_kwargs: dict = {
+            "words": subtitle_words,
+            "vertical_crop": req.vertical_crop,
+            "processing_mode": processing_mode,
+        }
+        if clip_title:
+            render_kwargs["title"] = clip_title
         await asyncio.to_thread(
             render_video,
             video_path,
             output_path,
             start_sec,
             end_sec,
-            words=subtitle_words,
-            vertical_crop=req.vertical_crop,
-            processing_mode=getattr(req, "processing_mode", "face_detection"),
+            **render_kwargs,
         )
 
         entries.append({

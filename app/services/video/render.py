@@ -22,6 +22,7 @@ def render_video(
     words: list | None = None,
     vertical_crop: bool = True,
     processing_mode: str = "face_detection",
+    title: str | None = None,
 ) -> None:
     processing_mode = (processing_mode or "face_detection").lower()
     if processing_mode not in ("face_detection", "no_face_detection"):
@@ -29,9 +30,18 @@ def render_video(
             f"Unknown processing_mode={processing_mode!r} "
             "(expected 'face_detection' or 'no_face_detection')"
         )
+    # AI title overlay is a no-face-vertical-only feature: face mode and
+    # non-vertical renders ignore it so their output is byte-identical to
+    # before this feature existed.
+    burn_title = (
+        vertical_crop
+        and processing_mode == "no_face_detection"
+        and bool((title or "").strip())
+    )
     logger.info(
-        "Rendering %s -> %s [%.1f, %.1f] vertical_crop=%s processing_mode=%s subtitles=%s",
+        "Rendering %s -> %s [%.1f, %.1f] vertical_crop=%s processing_mode=%s subtitles=%s title=%s",
         input_path, output_path, start_sec, end_sec, vertical_crop, processing_mode, bool(words),
+        bool(burn_title),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
@@ -66,15 +76,18 @@ def render_video(
             vf_parts.append("setsar=1")
 
     srt_path: Path | None = None
-    if words:
+    if words or burn_title:
         # Poppins Bold Italic (true) + random-pop colors via ASS.
         # Style lives inside the ASS (see subtitles.write_ass); fontsdir
-        # lets libass find assets/fonts/Poppins-*.
+        # lets libass find assets/fonts/Poppins-*. Title (when set) shares
+        # the subtitle style but renders top-center for the full duration.
         srt_path = TMP_DIR / f"sub-{os.getpid()}-{uuid.uuid4().hex[:8]}.ass"
         has_subs = write_ass(
             words, start_sec, end_sec, srt_path,
             font=settings.SUBTITLE_FONT,
             fontsize=settings.SUBTITLE_FONTSIZE,
+            title=title if burn_title else None,
+            title_marginv=settings.TITLE_MARGINV,
         )
         if has_subs:
             # ffmpeg's subtitles filter needs ':' escaped inside the path arg

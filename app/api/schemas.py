@@ -29,6 +29,10 @@ class ClipRequest(BaseModel):
     subtitles: Literal["none", "english", "native"] = Field(
         "none", description="Burn subtitles into the clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )
+    title: Optional[str] = Field(
+        None,
+        description="Optional upper title overlay. Only burned when vertical_crop=true and processing_mode=no_face_detection. When omitted in that mode, the title is auto-derived from AI viral analysis.",
+    )
 
 
 class AnalyzeClipsRequest(BaseModel):
