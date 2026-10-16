@@ -1,6 +1,11 @@
+import ctypes
+import glob
 import json
 import logging
 import os
+import site
+import sys
+import sysconfig
 import threading
 import time
 from pathlib import Path
@@ -9,16 +14,265 @@ from app.config import TMP_DIR, settings
 
 logger = logging.getLogger(__name__)
 
+# CUDA 12 runtime libs CTranslate2 loads by soname at the first GPU use.
+# Colab now ships the CUDA 13 toolkit, but CTranslate2 4.x is built against
+# CUDA 12 and the nvidia pip wheels provide those CUDA 12 builds.
+_CT2_CUDA_LIBS = (
+    "libcudart.so.12",
+    "libcublasLt.so.12",
+    "libcublas.so.12",
+    "libcudnn.so.9",
+)
+
 _whisper_model = None
 _whisper_lock = threading.Lock()
+_cuda_preload_lock = threading.Lock()
+_cuda_preload_done = False
+_pyav_compat_lock = threading.Lock()
+_pyav_compat_done = False
+
+
+def _site_package_dirs() -> list[str]:
+    """All site-packages/purelib dirs where pip may have placed nvidia wheels."""
+    dirs: list[str] = []
+    try:
+        dirs.extend(site.getsitepackages())
+    except (AttributeError, TypeError):
+        pass
+    try:
+        dirs.append(site.getusersitepackages())
+    except (AttributeError, TypeError):
+        pass
+    paths = sysconfig.get_paths()
+    for key in ("purelib", "platlib"):
+        if paths.get(key):
+            dirs.append(paths[key])
+    return [d for d in dict.fromkeys(dirs) if d]
+
+
+def _cuda_lib_search_dirs() -> list[Path]:
+    """Directories where CUDA 12 runtime libs may live (nvidia pip wheels + toolkit)."""
+    candidates: list[Path] = []
+    for base in _site_package_dirs():
+        if os.path.isdir(base):
+            candidates.extend(Path(base).glob("nvidia/*/lib"))
+            # Some layouts nest wheels deeper (e.g. Colab's nvidia/cuXX/lib).
+            candidates.extend(Path(base).glob("nvidia/*/*/lib"))
+    for pattern in (
+        "/usr/local/cuda*/targets/*/lib",
+        "/usr/local/cuda*/lib64",
+        "/usr/local/lib/python*/dist-packages/nvidia/*/lib",
+    ):
+        candidates.extend(Path(p) for p in glob.glob(pattern))
+    found: dict[str, Path] = {}
+    for d in candidates:
+        if d.is_dir():
+            found.setdefault(str(d), d)
+    return list(found.values())
+
+
+def _find_cuda_lib(directory: Path, name: str) -> Path | None:
+    exact = directory / name
+    if exact.is_file():
+        return exact
+    matches = sorted(directory.glob(name + "*"))
+    return matches[0] if matches else None
+
+
+def preload_ctranslate2_cuda_libs() -> list[str]:
+    """Preloads the CUDA 12 shared libs CTranslate2 resolves by soname at runtime.
+
+    Fixes `RuntimeError: Library libcublas.so.12 is not found or cannot be
+    loaded` on hosts where the system CUDA toolkit is v13 (e.g. Colab) but the
+    nvidia pip wheels ship the CUDA 12 runtime CTranslate2 was built against.
+    Exporting LD_LIBRARY_PATH only helps if it happens before the process
+    starts; setting os.environ at import time is too late (glibc snapshots it),
+    so instead each lib is dlopened by absolute path with RTLD_GLOBAL.
+
+    CTranslate2's later dlopen("libcublas.so.12") then resolves to the object
+    already loaded into the process. No-op on non-Linux and CPU-only hosts.
+    Returns the list of loaded library paths (empty when nothing was needed).
+    """
+    global _cuda_preload_done
+    if _cuda_preload_done or sys.platform != "linux":
+        return []
+    with _cuda_preload_lock:
+        if _cuda_preload_done:
+            return []
+        loaded: list[str] = []
+        search_dirs = _cuda_lib_search_dirs()
+        # Name-major order keeps dependencies (cudart) loaded before dependents.
+        for name in _CT2_CUDA_LIBS:
+            for directory in search_dirs:
+                lib = _find_cuda_lib(directory, name)
+                if lib is None:
+                    continue
+                try:
+                    ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+                except OSError as e:
+                    logger.debug("CUDA lib preload failed for %s: %s", lib, e)
+                    continue
+                loaded.append(str(lib))
+                break
+        _cuda_preload_done = True
+        if loaded:
+            logger.info("Preloaded CUDA libs for CTranslate2: %s", ", ".join(loaded))
+        else:
+            logger.debug("No CUDA runtime libs preloaded (none found or already loadable)")
+        return loaded
+
+
+def _pyav_supports_metadata_errors() -> bool:
+    import inspect
+
+    import av
+
+    try:
+        return "metadata_errors" in inspect.signature(av.open).parameters
+    except (TypeError, ValueError):
+        try:
+            return int(av.__version__.split(".")[0]) < 19
+        except (AttributeError, IndexError, ValueError):
+            return True
+
+
+def _ignore_invalid_frames(frames):
+    import av
+
+    iterator = iter(frames)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except av.error.InvalidDataError:
+            continue
+
+
+def _group_frames(frames, num_samples=None):
+    import av
+
+    fifo = av.audio.fifo.AudioFifo()
+    for frame in frames:
+        frame.pts = None  # Ignore timestamp check.
+        fifo.write(frame)
+        if num_samples is not None and fifo.samples >= num_samples:
+            yield fifo.read()
+    if fifo.samples > 0:
+        yield fifo.read()
+
+
+def _resample_frames(frames, resampler):
+    import itertools
+
+    # Add None to flush the resampler.
+    for frame in itertools.chain(frames, [None]):
+        yield from resampler.resample(frame)
+
+
+def _decode_audio_av19(input_file, sampling_rate: int = 16000, split_stereo: bool = False):
+    """Drop-in copy of faster_whisper.audio.decode_audio for PyAV >= 19.
+
+    PyAV 19 removed the metadata_errors kwarg that faster-whisper 1.2.1 still
+    passes; this variant reproduces the same 16 kHz mono float32 decoding
+    without it (modeled on the upstream fix for SYSTRAN/faster-whisper#1589).
+    """
+    import gc
+    import io
+
+    import av
+    import numpy as np
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16",
+        layout="mono" if not split_stereo else "stereo",
+        rate=sampling_rate,
+    )
+    raw_buffer = io.BytesIO()
+    dtype = None
+    with av.open(input_file, mode="r") as container:
+        frames = container.decode(audio=0)
+        frames = _ignore_invalid_frames(frames)
+        frames = _group_frames(frames, 500000)
+        frames = _resample_frames(frames, resampler)
+        for frame in frames:
+            array = frame.to_ndarray()
+            dtype = array.dtype
+            raw_buffer.write(array)
+    # Resampler internals need an explicit GC cycle (faster-whisper#390).
+    del resampler
+    gc.collect()
+    audio = np.frombuffer(raw_buffer.getbuffer(), dtype=dtype)
+    audio = audio.astype(np.float32) / 32768.0
+    if split_stereo:
+        return audio[0::2], audio[1::2]
+    return audio
+
+
+def ensure_faster_whisper_av_compat() -> bool:
+    """Makes faster-whisper work with PyAV >= 19 (metadata_errors was removed).
+
+    requirements.txt pins av==18.1.0, but when PyAV 19+ is present anyway
+    (preinstalled image, manual upgrade) every transcription would raise
+    `TypeError: open() got an unexpected keyword argument 'metadata_errors'`.
+    Rebinds decode_audio in both modules faster-whisper imports it into.
+    Returns True when the shim was installed, False when not needed.
+    """
+    global _pyav_compat_done
+    if _pyav_compat_done:
+        return False
+    with _pyav_compat_lock:
+        if _pyav_compat_done:
+            return False
+        _pyav_compat_done = True
+        try:
+            if _pyav_supports_metadata_errors():
+                return False
+            from faster_whisper import audio as fw_audio
+            from faster_whisper import transcribe as fw_transcribe
+
+            fw_audio.decode_audio = _decode_audio_av19
+            fw_transcribe.decode_audio = _decode_audio_av19
+            logger.info(
+                "PyAV >= 19 detected (metadata_errors removed) - installed "
+                "faster-whisper decode_audio compatibility shim"
+            )
+            return True
+        except ImportError as e:
+            logger.debug("PyAV compatibility shim skipped: %s", e)
+            return False
+
+
+def _verify_cuda_available() -> None:
+    """Fail fast with an actionable error when CTranslate2 cannot use CUDA."""
+    try:
+        import ctranslate2
+
+        devices = ctranslate2.get_cuda_device_count()
+    except Exception as e:
+        raise RuntimeError(
+            "WHISPER_DEVICE=cuda but CTranslate2 could not query CUDA devices "
+            f"({type(e).__name__}: {e}). Run `python scripts/check_gpu.py` for diagnostics."
+        ) from e
+    if devices < 1:
+        raise RuntimeError(
+            "WHISPER_DEVICE=cuda but CTranslate2 sees 0 CUDA devices. Pick a GPU "
+            "runtime (Colab: Runtime > Change runtime type > T4 GPU) or run "
+            "`python scripts/check_gpu.py` for diagnostics."
+        )
 
 
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
+        preload_ctranslate2_cuda_libs()
         with _whisper_lock:
             if _whisper_model is None:
                 from faster_whisper import WhisperModel
+
+                ensure_faster_whisper_av_compat()
+                if settings.WHISPER_DEVICE == "cuda":
+                    _verify_cuda_available()
 
                 logger.info(
                     "Loading Whisper model '%s' (device=%s, compute=%s, first call only)...",

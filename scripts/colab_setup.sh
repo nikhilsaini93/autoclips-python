@@ -38,6 +38,21 @@ if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt >/dev/null 2>&1
 fi
 
+# 3b) CUDA 12 libs: Colab ships the CUDA 13 toolkit, but CTranslate2
+#     (faster-whisper) is built for CUDA 12 — expose the nvidia pip wheels to
+#     the dynamic loader. The app preloads these itself; this export covers
+#     uvicorn/other tools launched from this shell.
+NVIDIA_LIBS=""
+for d in /usr/local/lib/python*/dist-packages/nvidia/*/lib \
+         /usr/local/lib/python*/site-packages/nvidia/*/lib \
+         /usr/local/lib/python*/dist-packages/nvidia/*/*/lib; do
+  [ -d "$d" ] && NVIDIA_LIBS="$NVIDIA_LIBS:$d"
+done
+if [ -n "$NVIDIA_LIBS" ]; then
+  export LD_LIBRARY_PATH="${NVIDIA_LIBS#:}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "==> CUDA 12 libs added to LD_LIBRARY_PATH"
+fi
+
 # 4) Cookies: clean a pasted/edited file, then verify it has login cookies
 if [ -f "$COOKIES" ]; then
   cp "$COOKIES" "$COOKIES.bak"
