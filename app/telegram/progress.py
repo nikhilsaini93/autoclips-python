@@ -33,6 +33,7 @@ _STAGE_LABELS = {
     "transcribing": "📝 Transcribing speech (long videos take a while on CPU)...",
     "analyzing": "🤖 AI finding viral moments...",
     "rendering": "🎬 Rendering clips...",
+    "splitting": "✂️ Splitting & converting parts...",
     "sending": "📤 Sending to Telegram...",
     "done": "✅ Done",
     "failed": "❌ Failed",
@@ -72,6 +73,26 @@ def format_timestamp_progress(job: dict, start: str, end: str, subtitles: str, p
         f"⏱️ {start} → {end}\n"
         f"📝 Subtitles: {subtitle_label(subtitles)}\n"
         f"🎞️ Mode: {processing_mode_label(processing_mode)}\n"
+        f"⏱️ Elapsed: {format_elapsed(job)}\n"
+        f"🆔 Job: {job.get('job_id', '')}"
+    )
+
+
+def format_split_progress(job: dict, aspect_ratio: str) -> str:
+    percent = int(job.get("percent", 0) or 0)
+    stage = job.get("stage", "") or job.get("progress", "")
+    total = int(job.get("total_clips", 0) or 0)
+    done = int(job.get("done_clips", 0) or 0)
+    label = _STAGE_LABELS.get(stage, stage or "Working...")
+    if total > 0:
+        counter = f"\n🧩 Parts completed: {done}/{total}"
+    else:
+        counter = "\n🧩 Planning parts..."
+    return (
+        "⏳ Splitting video into parts...\n\n"
+        f"{progress_bar(percent)}\n"
+        f"{label}{counter}\n"
+        f"📐 Output: {aspect_ratio}\n"
         f"⏱️ Elapsed: {format_elapsed(job)}\n"
         f"🆔 Job: {job.get('job_id', '')}"
     )

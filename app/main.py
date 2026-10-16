@@ -16,6 +16,7 @@ from app.api.deps import limiter
 from app.api.routes_analyze import router as analyze_router
 from app.api.routes_clip import router as clip_router
 from app.api.routes_health import router as health_router
+from app.api.routes_splitter import router as splitter_router
 from app.api.routes_subtitles import router as subtitles_router
 from app.api.routes_viral import router as viral_router
 from app.config import settings
@@ -115,3 +116,4 @@ app.include_router(subtitles_router)
 app.include_router(clip_router)
 app.include_router(analyze_router)
 app.include_router(viral_router)
+app.include_router(splitter_router)

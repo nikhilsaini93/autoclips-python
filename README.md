@@ -106,6 +106,22 @@ curl -X POST http://localhost:8000/clips/analyze \
 Titles, hashtags and descriptions come back in the **same language as the audio** (Hindi video → Hindi titles), ready to paste into the YouTube Shorts upload.
 The count isn't fixed — the AI decides how many clips are actually worth cutting from this specific video, anywhere from 1 to 10+. Use this to review the picks, then call `/clip` for the ones you want, or just call `/clips/viral` to render all of them in one go.
 
+**Split a video into equal parts, converted to 9:16 or 16:9 (no crop, black padding):**
+```bash
+curl -X POST http://localhost:8000/splitter/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=VIDEO_ID", "part_minutes": 2, "aspect_ratio": "9:16"}'
+```
+Returns `202` immediately with `job_id` + planned `total_parts`. Each part is lengthened/letterboxed onto a full 1080x1920 (or 1920x1080) canvas — the whole source frame stays visible, centered, with black bars. The last part takes the remainder (no frame duplicated or dropped); parts are re-encoded, never stream-copied, so boundaries are frame-accurate.
+
+```bash
+curl http://localhost:8000/splitter/jobs/JOB_ID                 # status + manifest (poll while running)
+curl http://localhost:8000/splitter/jobs/JOB_ID/parts           # part list: filename/start/end/size_mb
+curl -o part_01.mp4 http://localhost:8000/splitter/jobs/JOB_ID/parts/1
+curl -X DELETE http://localhost:8000/splitter/jobs/JOB_ID       # delete parts (409 while running; freed_mb)
+```
+Parts live under `storage/splitter/{job_id}/part_XX.mp4` with a `manifest.json`. The Telegram button "✂️ Split YouTube Video into Parts" runs the same pipeline with live progress messages (parts are not sent to Telegram — they stay on disk). There is no part-count cap; any positive `part_minutes` is accepted, and a pre-flight check refuses jobs when free disk < 2x source + `SPLITTER_MIN_DISK_FREE_MB`.
+
 ## Logs
 
 Every step logs progress with timing, since downloads/transcription/rendering can take a while:
@@ -127,9 +143,9 @@ Set verbosity with `LOG_LEVEL` in `.env` (`DEBUG` also logs every ffmpeg/yt-dlp 
 ## Ops
 
 - `GET /health` — ffmpeg/ffprobe availability, `GEMINI_API_KEY` set, disk free, Whisper model.
-- `GET /jobs/{job_id}` — Telegram long generations (`ai_viral`, `timestamp`) report `running/done/failed` + progress here.
-- `POST /admin/cleanup?max_age_hours=72` — purge `storage/downloads|clips|tmp|videos` files older than the TTL.
-- Rate limits (per IP, no auth): `/subtitles/english` + `/clip` 20/min, `/clips/analyze` 10/min, `/clips/viral` 5/min.
+- `GET /jobs/{job_id}` — Telegram long generations (`ai_viral`, `timestamp`, `splitter`) report `running/done/failed` + progress here.
+- `POST /admin/cleanup?max_age_hours=72` — purge `storage/downloads|clips|tmp|videos|splitter` files older than the TTL.
+- Rate limits (per IP, no auth): `/subtitles/english` + `/clip` 20/min, `/clips/analyze` + `/splitter/jobs` 10/min, `/clips/viral` 5/min.
 - Telegram is private: only `TELEGRAM_CHAT_ID` + `TELEGRAM_ALLOWED_CHAT_IDS` are served, others get `⛔ Unauthorized`.
 - Env knobs: `WHISPER_MODEL_SIZE/WHISPER_DEVICE/WHISPER_COMPUTE_TYPE`, `FFMPEG_PRESET`, `YOUTUBE_COOKIES_FILE`. See `.env.example`.
 
@@ -148,15 +164,15 @@ app/
   main.py              # FastAPI app + lifespan (uvicorn app.main:app)
   config.py            # Settings + storage/assets paths
   logging_config.py
-  api/                 # schemas + routes (health/subtitles/clip/analyze/viral)
+  api/                 # schemas + routes (health/subtitles/clip/analyze/viral/splitter)
   telegram/            # bot, handlers, sending, progress, approvals
   services/
     video/             # ids/download/transcribe/gemini/subtitles/faces/render/cleanup
     youtube/           # descriptions/uploads
-    jobs.py approvals.py viral.py
+    jobs.py approvals.py viral.py splitter.py
 assets/face_detector/  # OpenCV DNN weights
 scripts/               # get_youtube_token.py, send_telegram_test.py
 docs/                  # YOUTUBE_SETUP.md
-storage/               # gitignored: downloads/clips/tmp/videos/logs
+storage/               # gitignored: downloads/clips/tmp/videos/splitter/logs
 tests/unit/
 ```

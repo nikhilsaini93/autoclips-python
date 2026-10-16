@@ -2,13 +2,13 @@ import logging
 import time
 from pathlib import Path
 
-from app.config import CLIPS_DIR, DOWNLOAD_DIR, TMP_DIR, VIDEOS_DIR
+from app.config import CLIPS_DIR, DOWNLOAD_DIR, SPLITTER_DIR, TMP_DIR, VIDEOS_DIR
 
 logger = logging.getLogger(__name__)
 
 
 def cleanup_old_files(max_age_hours: float = 72, max_total_mb: float | None = None) -> dict:
-    """Delete files older than max_age_hours in storage/downloads|clips|tmp|videos.
+    """Delete files older than max_age_hours in storage/downloads|clips|tmp|videos|splitter.
 
     Optionally enforces a total size cap (oldest first) when max_total_mb is set.
     Returns {"deleted": N, "freed_mb": X}. Never deletes the folders themselves.
@@ -19,7 +19,7 @@ def cleanup_old_files(max_age_hours: float = 72, max_total_mb: float | None = No
     deleted = 0
     freed = 0
 
-    folders = [DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR]
+    folders = [DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR, SPLITTER_DIR]
     candidates: list[Path] = []
     for folder in folders:
         if not folder.exists():

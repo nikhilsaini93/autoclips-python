@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import shutil
@@ -249,6 +250,76 @@ def get_video_credit(video_id: str) -> str:
     except Exception:
         logger.debug("Could not fetch credit for video_id=%s", video_id, exc_info=True)
     return ""
+
+
+def get_video_metadata(video_id: str) -> dict:
+    """Fetches duration/title/dimensions via yt-dlp WITHOUT downloading.
+
+    Cached under storage/tmp/ so one video costs one lookup. Raises
+    RuntimeError with a readable message for private, unavailable,
+    age-restricted or live videos (no duration can be determined).
+    """
+    cache_path = TMP_DIR / f"{video_id}.meta.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("duration"):
+                return cached
+        except (OSError, ValueError):
+            pass
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    command = _ytdlp_base() + [
+        "--skip-download",
+        "--no-warnings",
+        "--print",
+        "%(duration)s||%(title)s||%(width)s||%(height)s",
+        url,
+    ]
+    try:
+        out = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("Timed out while fetching video info — try again.") from e
+
+    lines = (out.stdout or "").strip().splitlines()
+    line = lines[-1].strip() if lines else ""
+    if out.returncode != 0 or not line:
+        detail = (out.stderr or out.stdout or "").strip().splitlines()
+        detail = detail[-1] if detail else "yt-dlp failed"
+        raise RuntimeError(f"Could not fetch video info: {detail[:300]}")
+
+    parts = [p.strip() for p in line.split("||")]
+    try:
+        duration = float(parts[0]) if parts and parts[0] and parts[0] != "NA" else None
+    except ValueError:
+        duration = None
+    if not duration or duration <= 0:
+        raise RuntimeError(
+            "Could not determine the video duration — live streams, premieres "
+            "and restricted videos are not supported."
+        )
+
+    def _num(value):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    title = parts[1] if len(parts) > 1 else ""
+    if title in ("NA", "None"):
+        title = ""
+    meta = {
+        "video_id": video_id,
+        "duration": duration,
+        "title": title,
+        "width": _num(parts[2]) if len(parts) > 2 else None,
+        "height": _num(parts[3]) if len(parts) > 3 else None,
+    }
+    try:
+        cache_path.write_text(json.dumps(meta), encoding="utf-8")
+    except OSError:
+        pass
+    return meta
 
 
 def get_video_dimensions(input_path: Path):

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import shutil
 
-from app.config import CLIPS_DIR, DOWNLOAD_DIR, TMP_DIR, VIDEOS_DIR
+from app.config import CLIPS_DIR, DOWNLOAD_DIR, SPLITTER_DIR, TMP_DIR, VIDEOS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ def delete_all_files_sync():
     deleted_count = 0
     freed_bytes = 0
 
-    folders = [DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR]
+    folders = [DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR, SPLITTER_DIR]
 
     for folder in folders:
         if not folder.exists():

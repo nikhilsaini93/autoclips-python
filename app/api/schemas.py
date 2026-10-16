@@ -66,3 +66,24 @@ class ViralClipsRequest(BaseModel):
     subtitles: Literal["none", "english", "native"] = Field(
         "english", description="Burn subtitles into each clip (STT, no translation): none, english (transcribe original English speech), or native (transcribe as spoken, Hinglish preserved)"
     )
+
+
+class SplitterRequest(BaseModel):
+    url: str = Field(..., description="YouTube video URL")
+    part_minutes: float = Field(
+        ..., gt=0, description="Length of each output part in minutes (e.g. 2 or 1.5). The final part gets the remainder."
+    )
+    aspect_ratio: Literal["9:16", "16:9"] = Field(
+        "9:16",
+        description="Output canvas: 9:16 vertical (1080x1920) or 16:9 landscape (1920x1080). The full source frame is centered with black padding — no crop, no face detection.",
+    )
+
+
+class SplitterPartInfo(BaseModel):
+    part: int
+    filename: str
+    start: float
+    end: float
+    duration: float
+    size_mb: Optional[float] = None
+    status: str

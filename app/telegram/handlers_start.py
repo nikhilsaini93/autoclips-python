@@ -5,8 +5,17 @@ from telegram.ext import ContextTypes
 
 from app.services.video.timeutils import time_to_seconds
 from app.telegram.auth import reject_if_unauthorized
+from app.telegram.handlers_split import handle_split_minutes_input, start_split_flow
 
 logger = logging.getLogger(__name__)
+
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Create Shorts", callback_data="create_shorts")],
+        [InlineKeyboardButton("✂️ Split YouTube Video into Parts", callback_data="split_menu")],
+        [InlineKeyboardButton("🗑️ Delete Files", callback_data="delete_menu")],
+    ])
 
 
 async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -14,14 +23,9 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.clear()
 
-    keyboard = [
-        [InlineKeyboardButton("🎬 Create Shorts", callback_data="create_shorts")],
-        [InlineKeyboardButton("🗑️ Delete Files", callback_data="delete_menu")],
-    ]
-
     await update.message.reply_text(
         "🤖 AutoClips Bot\n\nChoose an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_main_menu_keyboard(),
     )
 
 
@@ -35,17 +39,18 @@ async def telegram_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("mode")
 
     # Prevent the old behavior: URL is accepted only after a mode is selected.
-    if mode not in ("ai", "timestamp"):
+    if mode not in ("ai", "timestamp", "split"):
         await update.message.reply_text(
             "Please choose an option first:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎬 Create Shorts", callback_data="create_shorts")],
-                [InlineKeyboardButton("🗑️ Delete Files", callback_data="delete_menu")],
-            ]),
+            reply_markup=_main_menu_keyboard(),
         )
         return
 
     context.user_data["youtube_url"] = url
+
+    if mode == "split":
+        await start_split_flow(update, context)
+        return
 
     if mode == "ai":
         keyboard = [
@@ -120,6 +125,9 @@ def parse_timestamp_range(value: str):
 
 async def telegram_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await reject_if_unauthorized(update):
+        return
+    if context.user_data.get("waiting_for_split_minutes"):
+        await handle_split_minutes_input(update, context)
         return
     if context.user_data.get("waiting_for_timestamp"):
         try:

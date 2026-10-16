@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     SNAP_TO_SILENCE: bool = True
     SNAP_WINDOW_SEC: float = 0.8
 
+    # YouTube splitter (storage/splitter/{job_id}/). No part-count cap — any
+    # positive part duration is accepted; this margin is the extra free disk
+    # required on top of 2x the source size before encoding starts.
+    SPLITTER_MIN_DISK_FREE_MB: int = 500
+
     def allowed_chat_ids(self) -> set[str]:
         ids = {c.strip() for c in self.TELEGRAM_ALLOWED_CHAT_IDS.split(",") if c.strip()}
         if self.TELEGRAM_CHAT_ID:
@@ -114,6 +119,7 @@ CLIPS_DIR = STORAGE_ROOT / "clips"
 TMP_DIR = STORAGE_ROOT / "tmp"
 VIDEOS_DIR = STORAGE_ROOT / "videos"
 LOGS_DIR = STORAGE_ROOT / "logs"
+SPLITTER_DIR = STORAGE_ROOT / "splitter"
 
 ASSETS_FACE_DIR = ROOT / "assets" / "face_detector"
 PROTOTXT_PATH = ASSETS_FACE_DIR / "deploy.prototxt"
@@ -121,5 +127,5 @@ CAFFEMODEL_PATH = ASSETS_FACE_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 YUNET_PATH = ASSETS_FACE_DIR / "face_detection_yunet_2023mar.onnx"
 YOLO_PATH = ASSETS_FACE_DIR / "yolov8n-face.pt"
 
-for _d in (DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR, LOGS_DIR, ASSETS_FACE_DIR):
+for _d in (DOWNLOAD_DIR, CLIPS_DIR, TMP_DIR, VIDEOS_DIR, LOGS_DIR, SPLITTER_DIR, ASSETS_FACE_DIR):
     _d.mkdir(parents=True, exist_ok=True)

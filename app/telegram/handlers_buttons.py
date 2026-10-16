@@ -9,6 +9,7 @@ from app.telegram.cleanup_files import delete_all_files
 from app.telegram.handlers_approve import handle_approve, handle_deny
 from app.telegram.handlers_approve_meta import handle_approve_fb, handle_approve_ig
 from app.telegram.handlers_generate import run_ai_generation, run_timestamp_generation
+from app.telegram.handlers_split import ask_split_confirm, run_split_generation
 from app.telegram.handlers_start import ask_processing_mode, ask_subtitles
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,32 @@ async def telegram_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as exc:
             if "Message is not modified" not in str(exc):
                 logger.warning("Telegram create_shorts edit failed: %s", exc)
+        return
+
+    if data == "split_menu":
+        context.user_data.clear()
+        context.user_data["mode"] = "split"
+        try:
+            await query.edit_message_text(
+                "✂️ Split YouTube Video into Parts\n\n"
+                "The video is cut into equal-length parts and each part is "
+                "converted to 9:16 or 16:9 with black padding (no cropping, "
+                "no face detection). Parts stay on disk under "
+                "storage/splitter/ — they are not sent to Telegram.\n\n"
+                "Now send the YouTube video URL."
+            )
+        except TelegramError as exc:
+            if "Message is not modified" not in str(exc):
+                logger.warning("Telegram split_menu edit failed: %s", exc)
+        return
+
+    if data.startswith("split_ratio:"):
+        ratio = data.split(":", 1)[1]
+        await ask_split_confirm(query, context, ratio)
+        return
+
+    if data == "split_confirm":
+        await run_split_generation(query, context)
         return
 
     if data == "delete_menu":
